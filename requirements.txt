@@ -1,0 +1,15 @@
+telethon
+aiohttp
+aiofiles
+motor
+pymongo
+dnspython
+psutil
+asyncio
+os
+import random
+import time
+import os
+from urllib.parse import urlparse
+
+from flask import Flask, request, jsonify
