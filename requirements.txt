@@ -1,2 +1,2 @@
-Flask
-aiohttp
+Flask==2.3.3
+aiohttp==3.9.1
