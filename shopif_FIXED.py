@@ -899,10 +899,7 @@ def health():
 
 
 if __name__ == "__main__":
-    print("\n" + "=" * 50)
-    print("  SHOPPIE BY XUNEZ")
-    print(f"  Max product price: ${MAX_PRODUCT_PRICE:.2f}")
-    cards = load_cards()
-    print("=" * 50)
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
 
