@@ -1,1 +1,1 @@
-web: python shopif_FIXED.py
+web: gunicorn shopify_api:app
