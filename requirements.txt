@@ -1,3 +1,5 @@
-flask
-flask-cors
-httpx
+flask==2.3.3
+flask-cors==4.0.0
+httpx==0.25.2
+gunicorn==21.2.0
+beautifulsoup4==4.12.2
