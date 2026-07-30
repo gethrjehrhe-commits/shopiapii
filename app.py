@@ -995,22 +995,18 @@ def shopify_checker():
     try:
         site = request.args.get('site')
         cc_string = request.args.get('cc')
-        proxy_str = request.args.get('proxy')
         
-        if not site:
-            return jsonify({"error": "Missing 'site' parameter", "status": False}), 400
-        
-        if not cc_string:
-            return jsonify({"error": "Missing 'cc' parameter", "status": False}), 400
+        if not site or not cc_string:
+            return jsonify({"error": "Missing site or cc"}), 400
         
         # Parse card
         cc_parts = cc_string.split('|')
         if len(cc_parts) != 4:
-            return jsonify({"error": "Invalid format. Use: CC|MM|YYYY|CVV", "status": False}), 400
+            return jsonify({"error": "Invalid format"}), 400
         
         cc, mes, ano, cvv = cc_parts
         
-        # Return a test response (replace with your actual logic)
+        # Your Shopify logic here
         return jsonify({
             "Gateway": "Shopify",
             "Price": 0.0,
@@ -1020,7 +1016,7 @@ def shopify_checker():
         })
         
     except Exception as e:
-        return jsonify({"error": str(e), "status": False}), 500
+        return jsonify({"error": str(e)}), 500
         
 # ============================================================
 # MAIN
