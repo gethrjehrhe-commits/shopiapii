@@ -996,28 +996,104 @@ def shopify_checker():
     try:
         site = request.args.get('site')
         cc_string = request.args.get('cc')
+        proxy_str = request.args.get('proxy')
         
-        if not site or not cc_string:
-            return jsonify({"error": "Missing site or cc"}), 400
+        if not site:
+            return jsonify({"error": "Missing 'site' parameter"}), 400
+        
+        if not cc_string:
+            return jsonify({"error": "Missing 'cc' parameter"}), 400
         
         # Parse card
         cc_parts = cc_string.split('|')
         if len(cc_parts) != 4:
-            return jsonify({"error": "Invalid format"}), 400
+            return jsonify({"error": "Invalid format. Use: CC|MM|YYYY|CVV"}), 400
         
         cc, mes, ano, cvv = cc_parts
         
-        # Your Shopify logic here
-        return jsonify({
-            "Gateway": "Shopify",
-            "Price": 0.0,
-            "Response": "TEST_OK",
-            "Status": True,
-            "cc": cc_string
-        })
+        # Run the actual Shopify checker
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            success, message, gateway, price, currency = loop.run_until_complete(
+                process_card_async(cc, mes, ano, cvv, site, None, proxy_str)
+            )
+        finally:
+            loop.close()
+        
+        # Format response based on status
+        if success:
+            # Check for specific response types
+            if "ORDER_PLACED" in message or "CHARGED" in message:
+                return jsonify({
+                    "Gateway": gateway,
+                    "Price": float(price) if price else 0.0,
+                    "Response": "𝘾𝙝𝙖𝙧𝙜𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: ORDER_PLACED",
+                    "Status": True,
+                    "cc": cc_string
+                })
+            elif "INSUFFICIENT_FUNDS" in message or "INSUFFICIENT" in message:
+                return jsonify({
+                    "Gateway": gateway,
+                    "Price": float(price) if price else 0.0,
+                    "Response": "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: INSUFFICIENT_FUNDS",
+                    "Status": True,
+                    "cc": cc_string
+                })
+            elif "INCORRECT_CVC" in message or "CVC" in message or "CVV" in message:
+                return jsonify({
+                    "Gateway": gateway,
+                    "Price": float(price) if price else 0.0,
+                    "Response": "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: INCORRECT_CVC",
+                    "Status": True,
+                    "cc": cc_string
+                })
+            elif "OTP_REQUIRED" in message or "OTP" in message or "3DS" in message:
+                return jsonify({
+                    "Gateway": gateway,
+                    "Price": float(price) if price else 0.0,
+                    "Response": "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: OTP_REQUIRED",
+                    "Status": True,
+                    "cc": cc_string
+                })
+            else:
+                # Default approved
+                return jsonify({
+                    "Gateway": gateway,
+                    "Price": float(price) if price else 0.0,
+                    "Response": f"𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: {message[:30]}",
+                    "Status": True,
+                    "cc": cc_string
+                })
+        else:
+            # Declined
+            if "CAPTCHA" in message:
+                return jsonify({
+                    "Gateway": gateway,
+                    "Price": 0.0,
+                    "Response": "𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: CAPTCHA_REQUIRED",
+                    "Status": False,
+                    "cc": cc_string
+                })
+            else:
+                return jsonify({
+                    "Gateway": gateway,
+                    "Price": 0.0,
+                    "Response": "𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: CARD_DECLINED",
+                    "Status": False,
+                    "cc": cc_string
+                })
         
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "error": str(e),
+            "status": False,
+            "Gateway": "UNKNOWN",
+            "Price": 0.0,
+            "Response": f"ERROR: {str(e)}",
+            "cc": request.args.get('cc', '')
+        }), 500
         
 # ============================================================
 # MAIN
