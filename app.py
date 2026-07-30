@@ -998,63 +998,30 @@ def shopify_checker():
         proxy_str = request.args.get('proxy')
         
         if not site:
-            return jsonify({
-                "error": "Missing 'site' parameter",
-                "status": False
-            }), 400
+            return jsonify({"error": "Missing 'site' parameter", "status": False}), 400
         
         if not cc_string:
-            return jsonify({
-                "error": "Missing 'cc' parameter in format CC|MM|YYYY|CVV",
-                "status": False
-            }), 400
+            return jsonify({"error": "Missing 'cc' parameter", "status": False}), 400
         
-        try:
-            cc_parts = parse_cc_string(cc_string)
-            cc = cc_parts['cc']
-            mes = cc_parts['mes']
-            ano = cc_parts['ano']
-            cvv = cc_parts['cvv']
-        except ValueError as e:
-            return jsonify({
-                "error": str(e),
-                "status": False
-            }), 400
+        # Parse card
+        cc_parts = cc_string.split('|')
+        if len(cc_parts) != 4:
+            return jsonify({"error": "Invalid format. Use: CC|MM|YYYY|CVV", "status": False}), 400
         
-        variant_id = request.args.get('variant')
+        cc, mes, ano, cvv = cc_parts
         
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # Your existing processing logic here...
         
-        try:
-            success, message, gateway, price, currency = loop.run_until_complete(
-                process_card_async(cc, mes, ano, cvv, site, variant_id, proxy_str)
-            )
-        finally:
-            loop.close()
-        
-        clean_response = extract_clean_response(message)
-        
-        response_data = {
-            "Gateway": gateway,
-            "Price": float(price) if price.replace('.', '', 1).isdigit() else 0.0,
-            "Response": clean_response,
-            "Status": success,
+        return jsonify({
+            "Gateway": "Shopify",
+            "Price": 0.0,
+            "Response": "TEST",
+            "Status": True,
             "cc": cc_string
-        }
-        
-        return jsonify(response_data)
+        })
         
     except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "status": False,
-            "Gateway": "UNKNOWN",
-            "Price": 0.0,
-            "Response": f"ERROR: {str(e)}",
-            "cc": request.args.get('cc', '')
-        }), 500
-
+        return jsonify({"error": str(e), "status": False}), 500
 # ============================================================
 # MAIN
 # ============================================================
