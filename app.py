@@ -76,7 +76,7 @@ def _rand_ch_ua():    return random.choice(_CH_UA_POOL)
 def _rand_platform(): return random.choice(['"Windows"', '"macOS"'])
 
 # ============================================================
-# SHOPIFY CHECKER — SIMPLIFIED WORKING VERSION
+# SHOPIFY CHECKER — FULL WORKING VERSION
 # ============================================================
 
 class ShopifyChecker:
@@ -614,6 +614,77 @@ def single_check():
             "Status": False,
             "cc": request.args.get('cc', '')
         }), 500
+
+@app.route('/mass', methods=['POST'])
+def mass_check():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Missing JSON payload"}), 400
+        
+        cards = data.get('cards', [])
+        site = data.get('site')
+        workers = data.get('workers', 5)
+        
+        if not cards or not isinstance(cards, list):
+            return jsonify({"error": "Missing 'cards' array"}), 400
+        
+        results = []
+        charged = 0
+        approved = 0
+        declined = 0
+        errors = 0
+        
+        async def check_one(cc):
+            nonlocal charged, approved, declined, errors
+            
+            target_site = site if site else get_random_site()
+            checker = ShopifyChecker(target_site)
+            category, cc_out, detail, used_site = checker.check_card(cc, target_site)
+            
+            response = format_response(category, cc_out, detail, used_site)
+            
+            if category == "CHARGED":
+                charged += 1
+            elif category == "APPROVED":
+                approved += 1
+            elif category == "DECLINED":
+                declined += 1
+            else:
+                errors += 1
+            
+            return response
+        
+        async def run_parallel():
+            semaphore = asyncio.Semaphore(workers)
+            async def limited_check(cc):
+                async with semaphore:
+                    loop = asyncio.get_event_loop()
+                    return await loop.run_in_executor(None, check_one, cc)
+            
+            tasks = [limited_check(cc) for cc in cards]
+            return await asyncio.gather(*tasks)
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            results = loop.run_until_complete(run_parallel())
+        finally:
+            loop.close()
+        
+        return jsonify({
+            "site": site if site else "auto-rotated",
+            "total": len(cards),
+            "charged": charged,
+            "approved": approved,
+            "declined": declined,
+            "errors": errors,
+            "results": results,
+            "timestamp": datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ============================================================
 # MAIN
