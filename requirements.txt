@@ -3,3 +3,6 @@ flask-cors==4.0.0
 httpx==0.25.2
 beautifulsoup4==4.12.2
 gunicorn
+Flask
+aiohttp
+gunicorn
