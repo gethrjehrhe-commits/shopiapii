@@ -1010,18 +1010,18 @@ def shopify_checker():
         
         cc, mes, ano, cvv = cc_parts
         
-        # Your existing processing logic here...
-        
+        # Return a test response (replace with your actual logic)
         return jsonify({
             "Gateway": "Shopify",
             "Price": 0.0,
-            "Response": "TEST",
+            "Response": "TEST_OK",
             "Status": True,
             "cc": cc_string
         })
         
     except Exception as e:
         return jsonify({"error": str(e), "status": False}), 500
+        
 # ============================================================
 # MAIN
 # ============================================================
