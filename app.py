@@ -8,6 +8,67 @@ import os
 import sys
 from datetime import datetime
 
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+import json
+
+app = Flask(__name__)
+CORS(app)
+
+# Health check endpoint
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+# Shopify endpoint
+@app.route('/shopify', methods=['POST'])
+def shopify():
+    """
+    POST /shopify
+    Expected JSON body:
+    {
+        "store_url": "store.myshopify.com",
+        "email": "user@example.com",
+        "password": "password"
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({"error": "No JSON body provided"}), 400
+        
+        store_url = data.get('store_url', '').strip()
+        email = data.get('email', '').strip()
+        password = data.get('password', '').strip()
+        
+        # Validate inputs
+        if not all([store_url, email, password]):
+            return jsonify({
+                "error": "Missing required fields: store_url, email, password"
+            }), 400
+        
+        # Normalize store URL
+        if not store_url.endswith('.myshopify.com'):
+            if '.' not in store_url:
+                store_url = f"{store_url}.myshopify.com"
+        
+        # Your Shopify logic here
+        # This is a placeholder - add your actual implementation
+        result = {
+            "status": "success",
+            "store": store_url,
+            "email": email,
+            "message": "Processing Shopify checkout"
+        }
+        
+        return jsonify(result), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+}
+
 _UA_POOL = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -1320,5 +1381,6 @@ def main():
     print()
 
 
-if __name__ == "__main__":
-    main()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
