@@ -750,8 +750,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     err0 = errors[0]
                     code = err0.get('code', '')
                     localized = err0.get('localizedMessage', '')
-                    nonlocal = err0.get('nonLocalizedMessage', '')
-                    detail = localized or nonlocal
+                    nonloc = err0.get('nonLocalizedMessage', '')
+                    detail = localized or nonloc
                     if detail and code in ('GENERIC_ERROR', 'PAYMENT_FAILED', ''):
                         return False, detail, gateway, total_price, currency
                     if code:
