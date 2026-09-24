@@ -33,7 +33,7 @@ def _load_gql(filename, min_len):
     logger.info(f"Loaded {filename}: {len(content)} chars")
     return content
 
-QUERY_PROPOSAL_SHIPPING = _load_gql("proposal.gql", 38000)
+QUERY_PROPOSAL_SHIPPING = _load_gql("proposal.gql", 30000)
 QUERY_PROPOSAL_DELIVERY = QUERY_PROPOSAL_SHIPPING
 MUTATION_SUBMIT         = _load_gql("submit.gql",   3000)
 QUERY_POLL              = _load_gql("poll.gql",      800)
