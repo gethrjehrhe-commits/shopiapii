@@ -13,42 +13,21 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# ==================== GRAPHQL QUERIES (inline, no .gql files needed) ====================
 
-def _load_gql(filename, min_len):
-    path = os.path.join(_SCRIPT_DIR, filename)
-    if not os.path.exists(path):
-        raise RuntimeError(
-            f"MISSING REQUIRED FILE: {filename}\n"
-            f"Place it in the same directory as app.py ({_SCRIPT_DIR}).\n"
-            f"Run extract_queries.py on the original app.py to generate it."
-        )
-    with open(path, 'r', encoding='utf-8') as f:
-        content = f.read().strip()
-    if len(content) < min_len:
-        raise RuntimeError(
-            f"QUERY TRUNCATED: {filename} is {len(content)} chars, "
-            f"minimum expected {min_len}. Re-extract from the original file."
-        )
-    logger.info(f"Loaded {filename}: {len(content)} chars")
-    return content
-
-# ==================== GRAPHQL QUERIES (inline) ====================
-
-QUERY_PROPOSAL_SHIPPING = """query Proposal($sessionInput:SessionTokenInput!,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$queueToken:String,$checkpointData:String,$note:NoteInput,$tip:TipTermInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput,$alternativePaymentCurrency:AlternativePaymentCurrencyInput,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$changesetTokens:[String!],$transformerFingerprintV2:String){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{sessionInput:$sessionInput,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,queueToken:$queueToken,checkpointData:$checkpointData,note:$note,tip:$tip,localizationExtension:$localizationExtension,nonNegotiableTerms:$nonNegotiableTerms,scriptFingerprint:$scriptFingerprint,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,poNumber:$poNumber,saleAttributions:$saleAttributions,alternativePaymentCurrency:$alternativePaymentCurrency,reduction:$reduction,availableRedeemables:$availableRedeemables,changesetTokens:$changesetTokens,transformerFingerprintV2:$transformerFingerprintV2}}){__typename result{...on NegotiationResultAvailable{checkpointData queueToken buyerProposal{__typename}sellerProposal{__typename runningTotal{value{amount currencyCode __typename}__typename}total{value{amount currencyCode __typename}__typename}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{availableDeliveryStrategies{handle amount{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{...on PaymentProvider{paymentMethodIdentifier displayName extensibilityDisplayName __typename}...on CustomOnsiteProvider{paymentMethodIdentifier name __typename}...on OffsiteProvider{paymentMethodIdentifier name __typename}__typename}__typename}__typename}}tax{__typename ...on FilledTaxTerms{totalTaxAmount{value{amount currencyCode __typename}__typename}__typename}}__typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}__typename}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}"""
+QUERY_PROPOSAL_SHIPPING = """query Proposal($alternativePaymentCurrency:AlternativePaymentCurrencyInput,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$changesetTokens:[String!],$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$transformerFingerprintV2:String,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{alternativePaymentCurrency:$alternativePaymentCurrency,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,reduction:$reduction,availableRedeemables:$availableRedeemables,tip:$tip,note:$note,poNumber:$poNumber,nonNegotiableTerms:$nonNegotiableTerms,localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,saleAttributions:$saleAttributions},checkpointData:$checkpointData,queueToken:$queueToken,changesetTokens:$changesetTokens}){__typename result{...on NegotiationResultAvailable{checkpointData queueToken sellerProposal{runningTotal{value{amount currencyCode __typename}__typename}total{value{amount currencyCode __typename}__typename}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{availableDeliveryStrategies{handle amount{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}}payment{__typename ...on FilledPaymentTerms{availablePaymentLines{paymentMethod{...on PaymentProvider{paymentMethodIdentifier displayName extensibilityDisplayName __typename}...on CustomOnsiteProvider{paymentMethodIdentifier name __typename}...on OffsiteProvider{paymentMethodIdentifier name __typename}...on LocalPaymentMethodConfig{paymentMethodIdentifier name displayName __typename}__typename}__typename}__typename}}tax{__typename ...on FilledTaxTerms{totalTaxAmount{value{amount currencyCode __typename}__typename}__typename}}__typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}__typename}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}"""
 
 QUERY_PROPOSAL_DELIVERY = QUERY_PROPOSAL_SHIPPING
 
 MUTATION_SUBMIT = """mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult analytics:$analytics){__typename ...on SubmitSuccess{receipt{id __typename}__typename}...on SubmitAlreadyAccepted{receipt{id __typename}__typename}...on SubmittedForCompletion{receipt{id __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{errors{code localizedMessage nonLocalizedMessage __typename}__typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}__typename}}"""
 
-QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){__typename ...on ProcessedReceipt{id orderStatusPageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}timeout{millisecondsRemaining __typename}__typename}...on FailedReceipt{id processingError{__typename ...on PaymentFailed{code messageUntranslated hasOffsitePaymentMethod __typename}...on OrderCreationFailure{paymentsHaveBeenReverted __typename}__typename}__typename}__typename}}"""
+QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){__typename ...on ProcessedReceipt{id orderStatusPageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}timeout{millisecondsRemaining __typename}__typename}...on FailedReceipt{id processingError{__typename ...on PaymentFailed{code messageUntranslated hasOffsitePaymentMethod __typename}...on OrderCreationFailure{paymentsHaveBeenReverted __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}__typename}__typename}__typename}}"""
 
-# Sanity check
 logger.info(f"QUERY_PROPOSAL_SHIPPING: {len(QUERY_PROPOSAL_SHIPPING)} chars")
 logger.info(f"MUTATION_SUBMIT: {len(MUTATION_SUBMIT)} chars")
 logger.info(f"QUERY_POLL: {len(QUERY_POLL)} chars")
-MUTATION_SUBMIT         = _load_gql("submit.gql",   3000)
-QUERY_POLL              = _load_gql("poll.gql",      800)
+
+# ==================== HELPERS ====================
 
 C2C = {"USD": "US", "CAD": "CA", "INR": "IN", "AED": "AE", "HKD": "HK", "GBP": "GB", "CHF": "CH"}
 
@@ -311,6 +290,8 @@ def safe_parse_json(text, label=""):
         return parsed, None
     except json.JSONDecodeError as e:
         return None, f"Invalid JSON ({label}): {e} — body: {text[:120].replace(chr(10), ' ')}"
+
+# ==================== MAIN LOGIC ====================
 
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
     gateway = "UNKNOWN"
